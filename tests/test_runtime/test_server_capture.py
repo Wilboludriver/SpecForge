@@ -827,6 +827,13 @@ class _KeepAliveCaptureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/spec_capture/control":
+            payload = b'{"detail":"legacy server"}'
+            self.send_response(404)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         sample_ids = [spec["sample_id"] for spec in body["spec_capture"]]
         with self.server.lock:
             self.server.requests.append((self.client_address[1], sample_ids))

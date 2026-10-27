@@ -58,6 +58,8 @@ a tombstone-then-free protocol — a follow-up tied to the shared metadata index
 
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
+
 import logging
 import os
 import threading
@@ -671,6 +673,15 @@ class MooncakeFeatureStore(FeatureStore):
         # can reclaim those provisional objects; a successful adopt clears it.
         self._external_provisional: Dict[Tuple[str, int], List[str]] = {}
         self._active_leases: Dict[str, FeatureHandle] = {}
+        self._capture_fences = {}
+        self._capture_handle_tokens = {}
+        self._capture_ack_pending = {}
+        self._capture_pending_begin = {}
+        self._capture_begin_lock = threading.RLock()
+        self._capture_cleanup_local = threading.local()
+        self._capture_read_local = threading.local()
+        self._capture_read_intents = {}
+        self._capture_reads = {}
         # Samples whose remote remove() failed. gc() performs bounded
         # steady-state retries; lifecycle drain either removes them or raises.
         self._release_pending: Dict[str, int] = {}
@@ -686,6 +697,233 @@ class MooncakeFeatureStore(FeatureStore):
         self._counter = 0
         self._gen_counter = 0
         self._stats = {"force_freed": 0, "force_freed_bytes": 0}
+
+    def _begin_capture_read(self, ref):
+        fence = self._capture_from_ref(ref)
+        if fence is None:
+            return None
+        owner = uuid.uuid4().hex
+        intent = {"fence": fence, "owner": owner, "token": None, "unsafe_fetch": False,
+                  "handle": None, "release_requested": False, "active": True}
+        with self._lock:
+            self._capture_read_intents[owner] = intent
+        # Keep intent before HTTP: lost acquire replies recover the same owner.
+        try:
+            with fence.lock:
+                intent["token"] = fence.acquire_read(owner)
+        except BaseException as exc:
+            from specforge.inference.capture_protocol import CaptureControlRejected
+            intent["active"] = False
+            if isinstance(exc, CaptureControlRejected):
+                with self._lock:
+                    self._capture_read_intents.pop(owner, None)
+            raise
+        return intent
+
+    def _release_capture_read(self, intent):
+        fence = intent["fence"]
+        with fence.lock:
+            if intent["token"] is None:
+                intent["token"] = fence.acquire_read(intent["owner"])
+            fence.release_read(intent["owner"], intent["token"])
+        with self._lock:
+            self._capture_read_intents.pop(intent["owner"], None)
+            handle = intent["handle"]
+            if handle is not None:
+                self._capture_reads.pop(handle.lease_token, None)
+                if intent["release_requested"]:
+                    self._active_leases.pop(handle.lease_token, None)
+                    self._capture_handle_tokens.pop(handle.lease_token, None)
+                    sid = handle.sample_id
+                    if (not self.retain_on_release and self._capture_fences.get(sid) is fence
+                            and not self._still_leased_locked(sid, handle.generation)):
+                        self._freed.add((sid, handle.generation))
+                        self._release_pending.setdefault(sid, 0)
+
+    def _recover_capture_reads(self, *, require_drained=False):
+        from specforge.inference.capture_protocol import CaptureControlRejected
+        with self._lock:
+            intents = list(self._capture_read_intents.values())
+        failures = []
+        for intent in intents:
+            if intent.get("active"):
+                continue
+            if intent["unsafe_fetch"]:
+                failures.append(intent["owner"] + ": receive drain unknown")
+                continue
+            if intent["handle"] is None or intent["release_requested"]:
+                try:
+                    self._release_capture_read(intent)
+                except CaptureControlRejected as exc:
+                    if intent["token"] is None:
+                        # No native read started; authoritative refusal proves
+                        # this owner has no active permit. Retire this intent only.
+                        with self._lock:
+                            self._capture_read_intents.pop(intent["owner"], None)
+                    else:
+                        intent["recovery_error"] = str(exc)
+                        failures.append(intent["owner"] + ": " + str(exc))
+                except Exception as exc:
+                    intent["recovery_error"] = str(exc)
+                    failures.append(intent["owner"] + ": " + str(exc))
+        if require_drained and failures:
+            raise RuntimeError("capture read ownership not drained; permits retained: " + repr(failures))
+
+    def begin_capture_attempt(self, protocol, capability, payload, tokens, attempt_id, feature_names):
+        sid = str(payload["sample_id"])
+        with self._capture_begin_lock:
+            with self._lock:
+                if sid in self._capture_pending_begin:
+                    raise RuntimeError("pending begin intent must be resolved first")
+                self._capture_pending_begin[sid] = (protocol, dict(capability), dict(payload), tuple(tokens), attempt_id, tuple(feature_names))
+            self.track_external_attempt(sid, generation=1, feature_names=list(feature_names), server_url=protocol.url.removesuffix("/spec_capture/control"))
+            return self._recover_capture_begin(sid)
+
+    def _recover_capture_begin(self, sid):
+        with self._capture_begin_lock:
+            with self._lock:
+                intent = self._capture_pending_begin.get(sid)
+            if intent is None:
+                return None
+            protocol, capability, payload, tokens, attempt_id, names = intent
+            wire = protocol.begin(capability, payload, tokens, attempt_id)
+            self.track_capture_fence(wire, names, control_fn=protocol.post)
+            with self._lock:
+                if self._capture_pending_begin.get(sid) is intent:
+                    self._capture_pending_begin.pop(sid, None)
+            return wire
+
+    @contextmanager
+    def _capture_cleanup_scope(self, sample_ids, *, expected_records=None):
+        # The initiating caller may already have crossed a network operation;
+        # carry its original identity rather than snapshotting a replacement.
+        with self._lock:
+            records = (dict(expected_records) if expected_records is not None else
+                       {sid: self._capture_fences.get(sid) for sid in sorted(set(sample_ids))})
+        local = self._capture_cleanup_local
+        previous = getattr(local, "records", {})
+        depth = getattr(local, "depth", 0)
+        with ExitStack() as stack:
+            for sid, fence in records.items():
+                if fence is None:
+                    continue
+                stack.enter_context(fence.lock)
+                with self._lock:
+                    still_current = self._capture_fences.get(sid) is fence
+                if still_current:
+                    try:
+                        fence.acquire_cleanup()
+                    except BaseException:
+                        with self._lock:
+                            if self._capture_fences.get(sid) is fence:
+                                self._generation.setdefault(sid, int(fence.wire["gen"]))
+                                self._sample_names.setdefault(sid, list(fence.names))
+                                self._sample_bytes.setdefault(sid, 0)
+                                self._release_pending.setdefault(sid, 0)
+                        raise
+            local.records = {**previous, **records}
+            local.depth = depth + 1
+            try:
+                yield records
+            finally:
+                local.records, local.depth = previous, depth
+                if depth == 0:
+                    self._flush_capture_acks(sample_ids=records)
+
+    def _capture_cleanup_allows(self, sid):
+        records = getattr(self._capture_cleanup_local, "records", {})
+        if sid not in records:
+            return self._capture_fences.get(sid) is None
+        return self._capture_fences.get(sid) is records[sid]
+
+    def track_capture_fence(self, wire, feature_names, *, control_fn=None):
+        from specforge.inference.capture_protocol import WriterFence, http_control
+        sid = str(wire["sample_id"])
+        if str(wire["store_id"]) != str(self.store_id) or int(wire["gen"]) != 1:
+            raise ValueError("capture fence store/generation mismatch")
+        with self._lock:
+            old = self._capture_fences.get(sid)
+            if old is not None:
+                if old.token != wire["reservation_token"]:
+                    raise RuntimeError("capture sample still has an unclean attempt")
+                return old
+            if any(h.sample_id == sid for h in self._active_leases.values()):
+                raise RuntimeError("capture sample has active consumer leases")
+            fence = WriterFence(dict(wire), tuple(feature_names), post=control_fn or http_control)
+            self._capture_fences[sid] = fence
+            # Only a server-authorized new reservation can retire the old g1 tombstone.
+            self._freed.discard((sid, 1))
+            return fence
+
+    def _capture_from_ref(self, ref, *, validate_remote=False):
+        wire = ref.metadata.get("capture_fence")
+        if wire is None:
+            return
+        sid = ref.sample_id
+        with self._lock:
+            old = self._capture_fences.get(sid)
+            if old is not None and old.token != wire["reservation_token"]:
+                raise KeyError("stale capture attempt ref")
+            if old is None and (sid, int(wire["gen"])) in self._freed:
+                raise KeyError("released capture attempt ref")
+        fence = self.track_capture_fence(wire, list(ref.feature_keys))
+        if validate_remote:
+            status = fence.control("resolve", cancel=False)
+            if status.get("state") != "PUBLISHED" or not status.get("writer_drained"):
+                from specforge.inference.capture_protocol import CaptureControlRejected
+                raise CaptureControlRejected("cannot adopt an attempt that is not currently PUBLISHED")
+        # A returned complete SampleRef is emitted only after writer completion.
+        fence.writer_drained = True
+        fence.adopted = True
+        return fence
+
+    def _resolve_capture_writer(self, sid, expected_token=None):
+        with self._lock:
+            fence = self._capture_fences.get(sid)
+            if fence is None:
+                return
+            if expected_token is not None and fence.token != expected_token:
+                return
+        with fence.lock:
+            fence.drain(cancel=True)
+
+    def _flush_capture_acks(self, sample_ids=None):
+        if getattr(self._capture_cleanup_local, "depth", 0):
+            return
+        with self._lock:
+            pending = sorted((sid, fence) for sid, fence in self._capture_ack_pending.items()
+                             if sample_ids is None or (sid in sample_ids and (not isinstance(sample_ids, dict) or sample_ids[sid] is fence)))
+        for sid, fence in pending:
+            with fence.lock:
+                fence.acknowledge()
+            with self._lock:
+                if self._capture_ack_pending.get(sid) is fence:
+                    self._capture_ack_pending.pop(sid, None)
+                if self._capture_fences.get(sid) is fence:
+                    self._capture_fences.pop(sid, None)
+
+    def prepare_capture_retry(self, sample_id):
+        sid = str(sample_id)
+        self._recover_capture_begin(sid)
+        with self._lock:
+            fence = self._capture_fences.get(sid)
+            if any(h.sample_id == sid for h in self._active_leases.values()):
+                raise RuntimeError("cannot replace capture with active consumer lease")
+            adopted_live = fence is not None and fence.adopted and sid in self._generation and sid not in self._release_pending
+        if adopted_live:
+            with fence.lock:
+                state = fence.control("resolve", cancel=False)
+                if state.get("state") != "RETIRED":
+                    raise RuntimeError("cannot replace an adopted live capture sample")
+                fence.remote_retired = fence.writer_drained = fence.removed = fence.acknowledged = True
+        if fence is not None:
+            self._resolve_capture_writer(sid, fence.token)
+            self.abort(sid, reason="capture-retry", attempt_token=fence.token)
+            self.drain_sample_removals([sid])
+        self._flush_capture_acks()
+        with self._lock:
+            if sid in self._capture_fences or sid in self._capture_ack_pending or sid in self._release_pending:
+                raise RuntimeError("prior capture cleanup has not drained")
 
     # -- keys --------------------------------------------------------------
     def _tkey(self, sample_id: str, gen: int, name: str) -> str:
@@ -985,6 +1223,7 @@ class MooncakeFeatureStore(FeatureStore):
             raise ValueError(
                 f"cannot adopt {sample_ref.sample_id}: ref carries no generation"
             )
+        self._capture_from_ref(sample_ref, validate_remote=True)
         self._locate(sample_ref)
         with self._lock:
             gen = int(gen)
@@ -1024,8 +1263,31 @@ class MooncakeFeatureStore(FeatureStore):
                 )
             self._external_provisional[(str(sample_id), int(generation))] = names
 
-    def discard_external_attempts(
-        self, *, reason: str = "unadopted-external-capture"
+    def discard_external_attempts(self, *, reason="unadopted-external-capture"):
+        self._recover_capture_reads(require_drained=True)
+        with self._lock:
+            pending_begins = list(self._capture_pending_begin)
+        for sid in pending_begins:
+            self._recover_capture_begin(sid)
+        with self._lock:
+            snapshot = [(identity, names, self._capture_fences.get(identity[0]))
+                        for identity, names in self._external_provisional.items()]
+        discarded = 0
+        legacy = []
+        for (sid, gen), names, expected in snapshot:
+            if expected is None:
+                legacy.append(((sid, gen), names))
+                continue
+            with expected.lock:
+                with self._lock:
+                    if self._capture_fences.get(sid) is not expected or (sid, gen) not in self._external_provisional:
+                        continue
+                self.abort(sid, reason=reason, attempt_token=expected.token)
+                discarded += 1
+        return discarded + (self._discard_external_attempts_legacy(reason=reason, expected_attempts=legacy) if legacy else 0)
+
+    def _discard_external_attempts_legacy(
+        self, *, reason: str = "unadopted-external-capture", expected_attempts=()
     ) -> int:
         """Abort server writes that never produced an adoptable response.
 
@@ -1035,18 +1297,21 @@ class MooncakeFeatureStore(FeatureStore):
         shutdown path. Physical-remove failures remain visible to
         :meth:`drain_pending_removals`.
         """
-        with self._lock:
-            attempts = list(self._external_provisional.items())
+        attempts = expected_attempts
 
         errors: Dict[str, str] = {}
         discarded = 0
         for (sample_id, generation), names in attempts:
             with self._lock:
+                fence = self._capture_fences.get(sample_id)
+            if fence is not None:
+                continue
+            with self._lock:
                 attempt_key = (sample_id, generation)
                 # A response can be adopted after the snapshot but before this
                 # attempt is visited. adopt() removes the provisional entry
                 # under the same lock, so never delete that now-live sample.
-                if attempt_key not in self._external_provisional:
+                if self._external_provisional.get(attempt_key) is not names or self._capture_fences.get(sample_id) is not None:
                     continue
                 current = self._generation.get(sample_id)
                 if current is not None:
@@ -1077,6 +1342,7 @@ class MooncakeFeatureStore(FeatureStore):
                     continue
                 self._external_provisional.pop(attempt_key, None)
                 discarded += 1
+        self._flush_capture_acks()
         if errors:
             raise RuntimeError(
                 "could not discard all provisional external captures: " f"{errors}"
@@ -1084,7 +1350,31 @@ class MooncakeFeatureStore(FeatureStore):
         return discarded
 
     # -- read --------------------------------------------------------------
-    def get(
+    def get(self, sample_ref: SampleRef, *, device="cpu", names=None):
+        self.auth.check(self._credential)
+        self._recover_capture_reads()
+        intent = self._begin_capture_read(sample_ref)
+        previous = getattr(self._capture_read_local, "intent", None)
+        self._capture_read_local.intent = intent
+        try:
+            result = self._get_impl(sample_ref, device=device, names=names)
+        except BaseException:
+            if intent is not None:
+                intent["active"] = False
+                if not intent["unsafe_fetch"]:
+                    intent["release_requested"] = True
+                    self._release_capture_read(intent)
+            raise
+        finally:
+            self._capture_read_local.intent = previous
+        if intent is not None:
+            with self._lock:
+                intent["handle"] = result[1]
+                self._capture_reads[result[1].lease_token] = intent
+                intent["active"] = False
+        return result
+
+    def _get_impl(
         self,
         sample_ref: SampleRef,
         *,
@@ -1092,6 +1382,7 @@ class MooncakeFeatureStore(FeatureStore):
         names: Optional[List[str]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], FeatureHandle]:
         self.auth.check(self._credential)
+        self._capture_from_ref(sample_ref)
         sid = sample_ref.sample_id
         ref_gen = sample_ref.metadata.get("generation")
         with self._lock:
@@ -1126,6 +1417,9 @@ class MooncakeFeatureStore(FeatureStore):
                 lease_token=f"{sid}:{self._counter}",
             )
             self._active_leases[handle.lease_token] = handle
+            fence = self._capture_fences.get(sid)
+            if fence is not None:
+                self._capture_handle_tokens[handle.lease_token] = fence.token
         return out, handle
 
     def _locate(self, sample_ref: SampleRef) -> None:
@@ -1168,7 +1462,13 @@ class MooncakeFeatureStore(FeatureStore):
                     f"(freed, stale, or never written)"
                 )
             # fresh alloc (or a pooled slot copied out) -> clone-on-fetch for free (B5)
-            out[n] = self._fetch_tensor(key, spec, device)
+            try:
+                out[n] = self._fetch_tensor(key, spec, device)
+            except BaseException:
+                intent = getattr(self._capture_read_local, "intent", None)
+                if intent is not None:
+                    intent["unsafe_fetch"] = True
+                raise
         return out, gen
 
     # -- lifetime ----------------------------------------------------------
@@ -1188,6 +1488,17 @@ class MooncakeFeatureStore(FeatureStore):
         disable that probe because probing a still-live key would renew its
         lease and make every following remove fail again.
         """
+        fence = self._capture_fences.get(sample_id)
+        expected = getattr(self._capture_cleanup_local, "records", {}).get(sample_id)
+        if expected is not None and fence is not expected:
+            return False
+        if fence is not None:
+            if expected is not fence:
+                return False
+            if fence.remote_retired:
+                return True  # Other store retired old attempt: discard LOCAL metadata only.
+            if not fence.writer_drained or not fence.cleanup_token:
+                return False
         gen = self._generation.get(sample_id)
         if gen is None:
             return True  # nothing tracked to remove (already freed)
@@ -1203,6 +1514,14 @@ class MooncakeFeatureStore(FeatureStore):
 
     def _free_bookkeeping_locked(self, sample_id: str) -> int:
         """Drop in-process tracking for a sample. Returns bytes accounted freed."""
+        fence = self._capture_fences.get(sample_id)
+        if fence is not None:
+            if not self._capture_cleanup_allows(sample_id):
+                raise RuntimeError("stale cleanup cannot mutate replacement bookkeeping")
+            if not fence.writer_drained:
+                raise RuntimeError("free bookkeeping before capture writer drain")
+            fence.removed = True
+            self._capture_ack_pending[sample_id] = fence
         generation = self._generation.get(sample_id)
         nbytes = self._sample_bytes.pop(sample_id, 0)
         self._generation.pop(sample_id, None)
@@ -1223,6 +1542,28 @@ class MooncakeFeatureStore(FeatureStore):
 
     def release(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
         with self._lock:
+            intent = self._capture_reads.get(handle.lease_token)
+            expected = intent["fence"] if intent is not None else self._capture_fences.get(handle.sample_id)
+            if intent is None and handle.lease_token not in self._active_leases and expected is not None:
+                return
+        if intent is not None:
+            intent["release_requested"] = True
+            self._release_capture_read(intent)
+            if self.retain_on_release:
+                return
+        with self._capture_cleanup_scope([handle.sample_id], expected_records={handle.sample_id: expected}):
+            return self._release_impl(handle, reason=reason)
+
+    def _release_impl(self, handle: FeatureHandle, *, reason: str = "consumed") -> None:
+        with self._lock:
+            if not self._capture_cleanup_allows(handle.sample_id):
+                return
+            expected = self._capture_handle_tokens.pop(handle.lease_token, None)
+            fence = self._capture_fences.get(handle.sample_id)
+            if expected is not None and (fence is None or fence.token != expected):
+                self._active_leases.pop(handle.lease_token, None)
+                return
+
             self._active_leases.pop(handle.lease_token, None)
             if self.retain_on_release:
                 return  # offline re-iterable set: keep for the next epoch
@@ -1239,8 +1580,36 @@ class MooncakeFeatureStore(FeatureStore):
                 # remote free deferred (lease) / failed -> gc() retries
                 self._release_pending.setdefault(sid, 0)
 
-    def abort(self, sample_id: str, *, reason: str = "aborted") -> None:
+        self._flush_capture_acks()
+
+    def abort(self, sample_id: str, *, reason: str = "aborted", attempt_token=None) -> None:
         with self._lock:
+            current = self._capture_fences.get(sample_id)
+            if attempt_token is not None and (current is None or current.token != attempt_token):
+                return
+        with self._capture_cleanup_scope([sample_id], expected_records={sample_id: current}):
+            return self._abort_impl(sample_id, reason=reason, attempt_token=attempt_token)
+
+    def _abort_impl(self, sample_id: str, *, reason: str = "aborted", attempt_token=None) -> None:
+        with self._lock:
+            if not self._capture_cleanup_allows(sample_id):
+                return
+            fence = self._capture_fences.get(sample_id)
+            if attempt_token is not None and (fence is None or fence.token != attempt_token):
+                return
+        if fence is not None:
+            self._resolve_capture_writer(sample_id, attempt_token)
+        with self._lock:
+            if fence is not None:
+                if self._capture_fences.get(sample_id) is not fence:
+                    return
+                if any(h.sample_id == sample_id for h in self._active_leases.values()):
+                    raise RuntimeError("cannot abort capture with active consumer lease")
+                # Lost responses have no adopted generation, but still own exact keys.
+                self._generation.setdefault(sample_id, int(fence.wire["gen"]))
+                self._sample_names.setdefault(sample_id, list(fence.names))
+                self._sample_bytes.setdefault(sample_id, 0)
+
             gen = self._generation.get(sample_id)
             if gen is not None:
                 self._freed.add((sample_id, gen))  # immediate logical free
@@ -1248,6 +1617,8 @@ class MooncakeFeatureStore(FeatureStore):
                 self._free_bookkeeping_locked(sample_id)
             else:
                 self._release_pending.setdefault(sample_id, 0)
+
+        self._flush_capture_acks()
 
     def drain_sample_removals(
         self,
@@ -1262,14 +1633,23 @@ class MooncakeFeatureStore(FeatureStore):
         Other pending samples may belong to prefetched, not-yet-durable
         batches and must remain available for crash replay.
         """
-        return self._drain_removals(
+        result = self._drain_removals(
             sample_ids=sample_ids,
             max_attempts=max_attempts,
             retry_interval_s=retry_interval_s,
             sleep=sleep,
         )
 
+        self._flush_capture_acks()
+        return result
+
     def retry_sample_removals(self, sample_ids: List[str]) -> Dict[str, Any]:
+        with self._lock:
+            targets = [sid for sid in sample_ids if sid in self._release_pending or sid in self._capture_ack_pending]
+        with self._capture_cleanup_scope(targets):
+            return self._retry_sample_removals_impl(sample_ids)
+
+    def _retry_sample_removals_impl(self, sample_ids: List[str]) -> Dict[str, Any]:
         """Try selected removals once, without probing or sleeping.
 
         The optimizer path calls this only for samples made durable at an
@@ -1286,6 +1666,8 @@ class MooncakeFeatureStore(FeatureStore):
                 if sample_id in target_ids
             ]
             for sample_id in pending:
+                if not self._capture_cleanup_allows(sample_id):
+                    continue
                 physically_removed = self._try_physical_free(
                     sample_id,
                     force=True,
@@ -1307,6 +1689,7 @@ class MooncakeFeatureStore(FeatureStore):
                 for sample_id in self._release_pending
                 if sample_id in target_ids
             ]
+        self._flush_capture_acks()
         return {
             "removed": removed,
             "removed_bytes": removed_bytes,
@@ -1331,14 +1714,24 @@ class MooncakeFeatureStore(FeatureStore):
         ``sleep`` is injectable so protocol tests can advance a fake lease clock
         without wall-clock delays.
         """
-        return self._drain_removals(
+        result = self._drain_removals(
             sample_ids=None,
             max_attempts=max_attempts,
             retry_interval_s=retry_interval_s,
             sleep=sleep,
         )
 
-    def _drain_removals(
+        self._flush_capture_acks()
+        return result
+
+    def _drain_removals(self, *, sample_ids, **kwargs):
+        self._recover_capture_reads(require_drained=True)
+        with self._lock:
+            targets = [sid for sid in set(self._release_pending) | set(self._capture_ack_pending) if sample_ids is None or sid in sample_ids]
+        with self._capture_cleanup_scope(targets):
+            return self._drain_removals_impl(sample_ids=sample_ids, **kwargs)
+
+    def _drain_removals_impl(
         self,
         *,
         sample_ids: Optional[List[str]],
@@ -1351,6 +1744,11 @@ class MooncakeFeatureStore(FeatureStore):
         if retry_interval_s < 0:
             raise ValueError("retry_interval_s must be >= 0")
         target_ids = None if sample_ids is None else set(sample_ids)
+        with self._lock:
+            fenced = [sid for sid in self._release_pending if target_ids is None or sid in target_ids]
+        for sid in fenced:
+            self._resolve_capture_writer(sid)
+        self._flush_capture_acks()
         removed = removed_bytes = 0
         last_errors: Dict[str, str] = {}
         attempts_run = 0
@@ -1371,6 +1769,8 @@ class MooncakeFeatureStore(FeatureStore):
                     }
                 final_attempt = attempt + 1 == max_attempts
                 for sample_id in pending:
+                    if not self._capture_cleanup_allows(sample_id):
+                        continue
                     try:
                         physically_removed = self._try_physical_free(
                             sample_id,
@@ -1431,6 +1831,17 @@ class MooncakeFeatureStore(FeatureStore):
         )
 
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
+        self._recover_capture_reads()
+        current = self._clock() if now is None else now
+        with self._lock:
+            targets = set(self._release_pending) | set(self._capture_ack_pending)
+            if self.max_hold_age_s is not None:
+                targets.update(sid for sid, start in self._put_time.items()
+                               if current-start > self.max_hold_age_s and not self._still_leased_locked(sid, self._generation.get(sid)))
+        with self._capture_cleanup_scope(targets):
+            return self._gc_impl(now=current)
+
+    def _gc_impl(self, *, now: Optional[float] = None) -> Dict[str, int]:
         now = self._clock() if now is None else now
         freed = freed_bytes = 0
         with self._lock:
@@ -1443,6 +1854,8 @@ class MooncakeFeatureStore(FeatureStore):
                     and not self._still_leased_locked(sid, self._generation.get(sid))
                 ]
                 for sid in stale:
+                    if not self._capture_cleanup_allows(sid):
+                        continue
                     if self._try_physical_free(sid, confirm_absent_on_failure=False):
                         freed_bytes += self._free_bookkeeping_locked(sid)
                         freed += 1
@@ -1451,6 +1864,8 @@ class MooncakeFeatureStore(FeatureStore):
             # Reconcile release-pending without an exists probe: is_exist grants
             # a read lease that would make the next remove fail (-706).
             for sid in list(self._release_pending):
+                if not self._capture_cleanup_allows(sid):
+                    continue
                 if self._release_pending[sid] >= self.max_release_attempts:
                     # Keep the physical key metadata and surface the pending
                     # sample. Lifecycle drain owns the final bounded retry and
@@ -1465,6 +1880,7 @@ class MooncakeFeatureStore(FeatureStore):
                     self._release_pending[sid] = attempts
             self._stats["force_freed"] += freed
             self._stats["force_freed_bytes"] += freed_bytes
+        self._flush_capture_acks()
         return {
             "force_freed": freed,
             "force_freed_bytes": freed_bytes,
@@ -1486,6 +1902,13 @@ class MooncakeFeatureStore(FeatureStore):
                 "backend": "mooncake",
                 "resident_samples": len(self._generation),
                 "provisional_external": len(self._external_provisional),
+                "capture_pending_begin": len(self._capture_pending_begin),
+                "capture_fences": len(self._capture_fences),
+                "capture_ack_pending": len(self._capture_ack_pending),
+                "capture_handle_attempts": len(self._capture_handle_tokens),
+                "capture_read_intents": len(self._capture_read_intents),
+                "capture_active_reads": len(self._capture_reads),
+                "capture_failed_reads": sum(bool(x["unsafe_fetch"]) for x in self._capture_read_intents.values()),
                 "active_leases": len(self._active_leases),
                 "resident_bytes": sum(self._sample_bytes.values()),
                 "max_resident_bytes": self.max_resident_bytes,
