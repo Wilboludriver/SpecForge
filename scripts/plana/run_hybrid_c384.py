@@ -106,7 +106,8 @@ def main():
                                            'hs_cache_unchanged': cache_snapshot(before) == cache_snapshot(after)}
             else:
                 probes = []
-                for _ in range(2 if index == 2 else 1):
+                lower_bound = CHUNK_TOKENS if index == 2 else 0
+                for _ in range(2):
                     response = ordinary_post(adapter.base_url + '/generate', json_body={
                         'input_ids': row['input_ids'], 'extra_key': capability['capture_namespace'],
                         'sampling_params': {'temperature': 0.0, 'max_new_tokens': 0}}, timeout=60)
@@ -118,15 +119,15 @@ def main():
                         'hs_cache_unchanged': cache_snapshot(before) == cache_snapshot(after)}
                     probes.append(probe)
                     action = 'later_checkpoint_probe' if index == 2 else 'ordinary_uncaptured_kv'
-                    actions[action] = {'probes': probes} if index == 2 else probe
+                    actions[action] = {'probes': probes}
                     write_json(run_dir / 'fixture-actions.json', actions)
                     if probe['has_spec_capture'] or not probe['hs_cache_unchanged']:
                         raise AssertionError('ordinary probe captured features or changed HS cache')
-                    if index == 6 or CHUNK_TOKENS < probe['cached_tokens'] < len(row['input_ids']):
+                    if lower_bound < probe['cached_tokens'] < len(row['input_ids']):
                         break
                     before = after
-                if index == 2 and not CHUNK_TOKENS < probes[-1]['cached_tokens'] < len(row['input_ids']):
-                    raise AssertionError('two same-row ordinary probes did not establish a later legal checkpoint')
+                if not lower_bound < probes[-1]['cached_tokens'] < len(row['input_ids']):
+                    raise AssertionError('two same-row ordinary probes did not establish the required legal checkpoint')
             write_json(run_dir / 'fixture-actions.json', actions)
 
         actual, info, diagnostics = capture_pass(args, cfg, resolved, plan, run_dir, 'candidate', rows,
