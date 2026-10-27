@@ -22,13 +22,14 @@ except ModuleNotFoundError as exc:
 
 
 class ByteBackend:
-    def __init__(self):self.data={};self.remove_calls=[];self.get_calls=[];self.fail_remove=False
+    def __init__(self):self.data={};self.remove_calls=[];self.get_calls=[];self.fail_remove=False;self.fail_get=False
     def register_buffer(self,ptr,size):return 0
     def unregister_buffer(self,ptr):return 0
     def is_exist(self,key):return int(key in self.data)
     def put_from(self,key,ptr,size,config=None):self.data[key]=ctypes.string_at(ptr,size);return 0
     def get_into(self,key,ptr,size):
         self.get_calls.append(key)
+        if self.fail_get:raise RuntimeError('injected uncertain native receive failure')
         if key not in self.data:return -1
         data=self.data[key];ctypes.memmove(ptr,data,min(size,len(data)));return min(size,len(data))
     def remove(self,key,**kw):
@@ -40,7 +41,7 @@ class ByteBackend:
 @unittest.skipUnless(AVAILABLE,'v1.2 bridge/store not integrated; pending cross-process cleanup acceptance')
 class CrossStoreCleanup(unittest.TestCase):
     def setUp(self):
-        self.backend=ByteBackend();self.clock_value=0.;self.stores=[];self.events=[];self.lost_cleanup_reply=False
+        self.backend=ByteBackend();self.clock_value=0.;self.stores=[];self.events=[];self.lost_cleanup_reply=False;self.lost_read_reply=False
         bridge=SpecFeatureBridge.__new__(SpecFeatureBridge)
         bridge.s=SimpleNamespace(ps=SimpleNamespace(tp_size=1,tp_rank=0),waiting_queue=[])
         bridge.writer=True;bridge.enabled=False;bridge.epoch='epoch';bridge.namespace='ns';bridge.signature='sig'
@@ -54,6 +55,9 @@ class CrossStoreCleanup(unittest.TestCase):
             if pool is not None:pool.close()
     def control(self,url,*,json_body,timeout):
         result=self.bridge.control(json_body);self.events.append((json_body['action'],result.get('state')))
+        if json_body['action']=='read_acquire' and self.lost_read_reply:
+            self.lost_read_reply=False
+            raise TimeoutError('injected lost read permit response after server grant')
         if json_body['action']=='cleanup_done' and self.lost_cleanup_reply:
             self.lost_cleanup_reply=False
             raise TimeoutError('injected lost response after server retirement')
@@ -173,6 +177,37 @@ class CrossStoreCleanup(unittest.TestCase):
         replacement=self.begin('attempt-b');self.published(replacement,19.)
         producer.drain_pending_removals(max_attempts=2,retry_interval_s=0)
         self.assert_replacement(19.)
+
+    def test_lost_read_acquire_recovers_held_owner_after_producer_revocation(self):
+        old,ref,producer,consumer=self.new_old_pair();self.lost_read_reply=True
+        calls=len(self.backend.get_calls)
+        with self.assertRaises(TimeoutError):consumer.get(ref)
+        self.assertEqual(len(self.backend.get_calls),calls,'failed read-acquire reached native fetch')
+        self.assertEqual(consumer.health()['capture_read_intents'],1)
+        try:producer.abort(ref.sample_id,attempt_token=old['reservation_token'])
+        except Exception:pass
+        self.assert_replacement(1.)
+        self.clock_value=10.
+        # Recovery must return the already-held owner's token even when A was
+        # revoked, so it can release without authorizing any new reader.
+        consumer.gc();consumer.drain_pending_removals(max_attempts=3,retry_interval_s=0)
+        self.assertEqual(consumer.health()['capture_read_intents'],0)
+        replacement=self.begin('attempt-b');self.published(replacement,23.)
+        producer.drain_pending_removals(max_attempts=2,retry_interval_s=0)
+        self.assert_replacement(23.)
+
+    def test_uncertain_native_receive_keeps_read_permit_and_blocks_cleanup(self):
+        old,ref,producer,consumer=self.new_old_pair();self.backend.fail_get=True
+        with self.assertRaises(Exception):consumer.get(ref)
+        self.assertGreater(consumer.health()['capture_failed_reads'],0)
+        calls=len(self.backend.remove_calls)
+        try:producer.abort(ref.sample_id,attempt_token=old['reservation_token'])
+        except Exception:pass
+        self.assertEqual(len(self.backend.remove_calls),calls)
+        with self.assertRaises(Exception):consumer.drain_pending_removals(max_attempts=1,retry_interval_s=0)
+        self.assertEqual(len(self.backend.remove_calls),calls)
+        with self.assertRaises(ValueError):self.begin('attempt-b')
+        self.assert_replacement(1.)
 
     def test_unknown_old_server_state_fails_closed_before_delete(self):
         old,ref,producer,consumer=self.new_old_pair()
