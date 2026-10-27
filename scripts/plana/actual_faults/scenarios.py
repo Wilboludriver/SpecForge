@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import json
+import hashlib
 from pathlib import Path
 import time
 import uuid
@@ -28,6 +29,34 @@ def command(directory, action, *, tp_size, timeout, **values):
     paths = [Path(directory) / f'ack-{identifier}-rank{rank}.json' for rank in range(tp_size)]
     wait_for(lambda: all(path.exists() for path in paths), timeout, 'all-rank test command acknowledgment')
     return [read_json(path) for path in paths]
+
+
+def assert_cuda_cancel_receipts(rows, case_id, marker):
+    selected = [row for row in rows if row.get('case_id') == case_id]
+    def one(event):
+        found = [row for row in selected if row['event'] == event]
+        if len(found) != 1:
+            raise AssertionError('CUDA cancellation requires exactly one '+event)
+        return found[0]
+    queued = one('delayed_real_cuda_event')
+    cancelled = one('cancel_event_observation')
+    applied = one('cancel_control_applied')
+    released = one('cuda_gate_released')
+    if (not marker['pending'] or marker['stage'] != 'after_real_aux_d2h'
+            or marker['issued'] != ['aux'] or not queued['event_pending']
+            or queued['stage'] != marker['stage'] or queued['issued'] != ['aux']
+            or not cancelled['event_pending'] or released['reason'] != 'observed_cancel'
+            or not queued['seq'] < cancelled['seq'] < applied['seq'] < released['seq']
+            or applied['state'] != 'DRAINING' or applied['writer_drained'] is not False
+            or not queued['monotonic_ns'] <= cancelled['monotonic_ns'] <= applied['monotonic_ns'] <= released['monotonic_ns']
+            or not queued['event_handle'] == cancelled['event_handle'] == marker['event_handle']
+            or queued['event_handle'] == queued['producer_event_handle']
+            or set(queued['source_pointers']) != {'aux', 'last_hidden'}
+            or any(not pointer for pointer in queued['source_pointers'].values())
+            or any(row['rank'] != 0 for row in (queued,cancelled,applied,released))):
+        raise AssertionError('real DMA cancellation lacks pending-event identity, order or explicit release proof')
+    return {'event_handle':queued['event_handle'],'pending_at_cancel':True,
+            'release_reason':released['reason'],'stage':marker['stage']}
 
 
 def assert_clean_server(stats):
@@ -68,6 +97,12 @@ def check_features(features, row, model, *, reference=None, rtol=.02, atol=.02):
     return {name: value.detach().cpu().clone() for name, value in features.items()}
 
 
+def run_namespace(directory):
+    # Include the unique outer run directory even when the supervisor calls
+    # every inner driver directory "engine". Restart children remain separate.
+    return 'actual-' + hashlib.sha256(str(Path(directory).resolve()).encode()).hexdigest()[:24]
+
+
 class Client:
     def __init__(self, config, directory, base_url):
         from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter, ServerCaptureSchema, _SessionPost
@@ -75,7 +110,9 @@ class Client:
         from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
         self.config, self.directory, self.base_url = config, Path(directory), base_url
         self.model = config['model']
-        self.run_id = self.directory.name
+        self.run_id = run_namespace(self.directory)
+        atomic_json(self.directory/'sample-namespace.json',
+                    {'directory':str(self.directory.resolve()),'store_id':self.run_id})
         self.tp_size = config['engine_kwargs']['tp_size']
         self.timeout = float(config.get('timeout_s', 90))
         self.store = MooncakeFeatureStore(store_id=self.run_id, setup_kwargs=config['store_setup'],
@@ -83,6 +120,7 @@ class Client:
         self.transport = _SessionPost()
         self.local = __import__('threading').local()
         def post(url, *, json_body, timeout):
+            sent_ns = time.monotonic_ns()
             if url.endswith('/generate'):
                 body = dict(json_body)
                 body['rid'] = [self.local.rid]
@@ -90,7 +128,8 @@ class Client:
                     body['spec_capture'] = [dict(value, force_full_prefill=True) for value in body['spec_capture']]
                 json_body = body
             result = self.transport(url, json_body=json_body, timeout=timeout)
-            append_json(self.directory / 'http-responses.jsonl', {'url': url, 'response': result})
+            append_json(self.directory / 'http-responses.jsonl', {'url': url, 'response': result,
+                        'sent_monotonic_ns':sent_ns,'received_monotonic_ns':time.monotonic_ns()})
             return result
         self.post = post
         self.schema = ServerCaptureSchema('hidden_states', 'target_last_hidden_states',
