@@ -175,7 +175,18 @@ def run(config, directory):
                     case['diagnostics']=ref.metadata['capture_diagnostics']
                     assert_prefill_retract_receipts(directory,case_id,tp,case['diagnostics'])
                 elif kind == 'hs_only':
-                    client.transport(client.base_url+'/flush_cache',json_body=None,timeout=timeout)
+                    before_flush = client.cleanup()
+                    response = client.transport._session().post(
+                        client.base_url+'/flush_cache', json={}, timeout=timeout)
+                    response.raise_for_status()
+                    after_flush = client.cleanup()
+                    keys = ('ready_blocks','ready_bytes','cache_bytes')
+                    before_hs = {key:before_flush['cache'][key] for key in keys}
+                    after_hs = {key:after_flush['cache'][key] for key in keys}
+                    if response.status_code != 200 or before_hs != after_hs:
+                        raise AssertionError('actual engine flush did not preserve READY HS')
+                    case['engine_flush'] = {'status':response.status_code,'body':response.text,
+                                            'before_hs':before_hs,'after_hs':after_hs}
                     arm(directory,case_id,'coverage',rid,sample_id,[],require_cow=False)
                     _, ref = client.fetch(client.submit(task_id,query,rid=rid)[0],query,reference=golden)
                     diag = ref.metadata['capture_diagnostics']
