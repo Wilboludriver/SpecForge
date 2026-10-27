@@ -144,7 +144,7 @@ class RuntimeContracts(unittest.TestCase):
         self.zero_private(controller)
 
     def test_exact_independent_budgets_include_passthrough_and_no_oversize_fallback(self):
-        controller=CaptureController(self.cache,self.schema,132,139,132);self.addCleanup(controller.shutdown,wait=True)
+        controller=CaptureController(self.cache,self.schema,256,139,256);self.addCleanup(controller.shutdown,wait=True)
         reservation=controller.try_reserve_output(self.execution,11,0,7)
         self.assertEqual(controller.stats()['output_bytes'],139)
         other=dataclasses.replace(self.execution,request_id='other')
@@ -152,7 +152,7 @@ class RuntimeContracts(unittest.TestCase):
         controller.release_output(reservation);controller.release_output(reservation);self.zero_private(controller)
         with self.assertRaises(ValueError):controller.try_reserve_output(other,11,0,8)
         self.zero_private(controller)
-        small=CaptureController(self.cache,self.schema,60,132,60);self.addCleanup(small.shutdown,wait=True)
+        small=CaptureController(self.cache,self.schema,64,132,64);self.addCleanup(small.shutdown,wait=True)
         valid=small.try_reserve_output(self.execution,11,6,0);self.assertIsNotNone(valid);small.release_output(valid);self.zero_private(small)
         with self.assertRaises(ValueError):small.try_reserve_output(other,11,0,0)
         self.zero_private(small)
