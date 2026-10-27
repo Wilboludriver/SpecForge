@@ -8,6 +8,7 @@ import ctypes
 import importlib.util
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 
@@ -208,6 +209,34 @@ class CrossStoreCleanup(unittest.TestCase):
         self.assertEqual(len(self.backend.remove_calls),calls)
         with self.assertRaises(ValueError):self.begin('attempt-b')
         self.assert_replacement(1.)
+
+    def test_old_handle_release_keeps_original_fence_after_reentrant_replacement(self):
+        old,ref,producer,consumer=self.new_old_pair();_,handle=consumer.get(ref)
+        original=consumer._release_capture_read;replacement=[];new_refs=[]
+        def switch_after_remote_reader_release(intent):
+            original(intent)
+            consumer.abort(ref.sample_id,attempt_token=old['reservation_token'])
+            wire=self.begin('replacement-between-reader-release-and-cleanup');new_ref=self.published(wire,29.)
+            consumer.track_capture_fence(wire,['hidden_states'],control_fn=self.control);consumer.adopt(new_ref)
+            replacement.append(wire);new_refs.append(new_ref)
+        with mock.patch.object(consumer,'_release_capture_read',side_effect=switch_after_remote_reader_release):
+            consumer.release(handle)
+        self.assert_replacement(29.)
+        self.assertEqual(self.bridge.registry.lookup(replacement[0]).attempt_id,'replacement-between-reader-release-and-cleanup')
+        self.assertNotIn(('same-sample',1),consumer._freed,'old release tombstoned authorized replacement')
+        self.assertNotIn('same-sample',consumer._release_pending)
+        values,new_handle=consumer.get(new_refs[0]);self.assertTrue(torch.equal(values['hidden_states'],torch.full((1,4,2),29.)))
+        consumer.release(new_handle)
+
+    def test_retain_on_release_never_tombstones_or_acquires_cleanup(self):
+        old,ref,producer,consumer=self.new_old_pair();consumer.retain_on_release=True
+        _,handle=consumer.get(ref);consumer.release(handle)
+        self.assertEqual(self.backend.remove_calls,[])
+        self.assertNotIn(('same-sample',1),consumer._freed);self.assertNotIn('same-sample',consumer._release_pending)
+        self.assertFalse(any(action=='cleanup_acquire' for action,state in self.events),'retained read release requested deletion permission')
+        values,handle2=consumer.get(ref);self.assertTrue(torch.equal(values['hidden_states'],torch.ones(1,4,2)));consumer.release(handle2)
+        self.assertEqual(consumer.health()['active_leases'],0);self.assertEqual(consumer.health()['capture_active_reads'],0)
+        self.assertEqual(self.bridge.registry.lookup(old).state,'PUBLISHED');self.assert_replacement(1.)
 
     def test_unknown_old_server_state_fails_closed_before_delete(self):
         old,ref,producer,consumer=self.new_old_pair()
