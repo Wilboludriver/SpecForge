@@ -77,13 +77,15 @@ def extract_capture_result(response,sample_id):
 
 
 def validate_diagnostics(result,N,*,require_cache):
-    fields=('H','L','N','span','execution_epoch','rank','attempt_id','reservation_token','server_epoch','capture_signature','capture_namespace','reused_tokens')
+    fields=('H','L','N','span','execution_epoch','rank','issue_sequence','attempt_id','reservation_token','server_epoch','capture_signature','capture_namespace','reused_tokens')
     missing=[field for field in fields if field not in result]
     if missing:
         if require_cache:raise AssertionError(f'candidate omitted required diagnostics: {missing}')
         return {'H':0,'L':0,'N':N,'span':[0,N],'source':'official-only full prefill'}
     if type(result['H']) is not int or type(result['L']) is not int or result['N']!=N or not 0<=result['L']<=result['H']<=N:
         raise AssertionError(f'invalid H/L/N diagnostics {result}')
+    if type(result['issue_sequence']) is not int or result['issue_sequence']<1:
+        raise AssertionError('invalid server-issued attempt sequence')
     if result['span']!=[result['L'],N] or result['reused_tokens']!=result['L'] or result['L']>=N:
         raise AssertionError('absolute suffix or engine N-1 constraint violated')
     return {field:result[field] for field in fields}

@@ -94,6 +94,19 @@ class BridgeContracts(unittest.TestCase):
         with self.assertRaises(ValueError):bridge.control(self.body(sample='third'))
         self.assertEqual(len(bridge.registry.active),2)
 
+    def test_released_read_owner_replay_is_denied_until_retirement_with_hard_bound(self):
+        bridge=self.bridge();wire=bridge.control(self.body());bridge.registry.lookup(wire).state='PUBLISHED'
+        for owner in ('reader-one','reader-two'):
+            permit=bridge.control({**wire,'action':'read_acquire','reader_owner':owner})
+            bridge.control({**wire,'action':'read_release','reader_owner':owner,'reader_token':permit['reader_token']})
+            with self.assertRaises(ValueError):bridge.control({**wire,'action':'read_acquire','reader_owner':owner})
+        with self.assertRaises(ValueError):bridge.control({**wire,'action':'read_acquire','reader_owner':'third-owner-over-capacity'})
+        with self.assertRaises(ValueError):bridge.control({**wire,'action':'read_acquire','reader_owner':'reader-one'})
+        self.assertEqual(len(bridge.registry.lookup(wire).readers),0)
+        self.retire(bridge,wire)
+        replacement=bridge.control(self.body(attempt='replacement'))
+        self.assertNotEqual(replacement['reservation_token'],wire['reservation_token'])
+
     def test_journal_restores_after_append_and_releases_exact_lock_once(self):
         tree=Tree();existing=object();req=SimpleNamespace(extend_range='before',skip_lock_node_ids={'old'},swa_uuid_for_lock='swa-before')
         adder=SimpleNamespace(tree_cache=tree,can_run_list=[existing],preempt_list=[],rem_total_tokens=100.,rem_input_tokens=80,hit_tokens=3)
