@@ -12,6 +12,7 @@ import argparse
 import dataclasses
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import time
 import traceback
 from unittest import mock
 
+from extended_checks import (checkpoint_subset_audit, compare_metric_trees, extract_capture_result, feature_regions, validate_diagnostics)
 from validation_helpers import (append_json, file_sha256, load_cases,
                                 tensor_errors, tensor_sha256, validate_features, write_json)
 
@@ -130,13 +132,21 @@ def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
     def record_post(url, *, json_body, timeout):
         result = post(url, json_body=json_body, timeout=timeout)
         append_json(run_dir/'http-responses.jsonl', {"pass": pass_name, "url": url, "body": json_body, "response": result})
+        if url.endswith('/generate'):
+            captures.append(result)
         return result
-    adapter = SGLangServerCaptureAdapter(env['DISAGG_SERVER_URLS'], store, run_id=namespace, algorithm='dflash', schema=schema, server_capture='patch', post_fn=record_post)
+    adapter_options = {}
+    if 'control_fn' in inspect.signature(SGLangServerCaptureAdapter).parameters:
+        adapter_options['control_fn'] = record_post
+    elif args.require_cache:
+        raise AssertionError('cache candidate lacks negotiated control_fn interface')
+    adapter = SGLangServerCaptureAdapter(env['DISAGG_SERVER_URLS'], store, run_id=namespace, algorithm='dflash', schema=schema, server_capture='patch', post_fn=record_post, **adapter_options)
     contract = CaptureConfig.from_strategy(required_features={'input_ids','loss_mask','hidden_states','target_last_hidden_states'},
                                            aux_hidden_state_layer_ids=layers, target_repr='hidden_state', target_hidden_size=h)
     directory = run_dir/pass_name
     directory.mkdir()
     expected_keys = []
+    diagnostics = []
     try:
         for index, row in enumerate(rows):
             task = PromptTask(task_id=f'{index:02d}-{row["id"]}', run_id=namespace, source_id='plana-native16',
@@ -145,6 +155,9 @@ def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
             ref, = adapter.produce_refs([task], capture=contract)
             if not isinstance(ref, SampleRef):
                 raise AssertionError(f'{row["id"]}: capture failed: {ref}')
+            raw_result = extract_capture_result(captures[-1], ref.sample_id)
+            diagnostic = validate_diagnostics(raw_result, len(row['input_ids']), require_cache=args.require_cache)
+            diagnostics.append(diagnostic)
             keys = [store._tkey(ref.sample_id, int(ref.metadata['generation']), name) for name in ref.feature_specs]
             expected_keys.extend(keys)
             handle = None
@@ -166,16 +179,18 @@ def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
             if remaining:
                 raise AssertionError(f'{row["id"]}: keys remain after explicit release drain: {remaining}')
             result = {"pass": pass_name, "index": index, "case": row['id'], "N": len(row['input_ids']),
-                      "seconds": time.perf_counter()-started, "hashes": hashes, "keys_removed": len(keys), "ref": dataclasses.asdict(ref), "health": store.health()}
+                      "seconds": time.perf_counter()-started, "hashes": hashes, "keys_removed": len(keys), "ref": dataclasses.asdict(ref), "health": store.health(), "diagnostics": diagnostic}
             append_json(run_dir/'case-results.jsonl', result)
-            captures.append(directory/f'{index:02d}-{row["id"]}.pt')
             print(f'CAPTURE {pass_name} {index+1:02d}/16 {row["id"]} N={len(row["input_ids"])} keys_removed={len(keys)}', flush=True)
     finally:
         cleanup_store(store, expected_keys, directory)
-    return captures, {"hidden_size": h, "layers": list(layers), "draft_config": draft_config.to_dict()}
+    if args.require_cache and not any(d['L'] > 0 for d in diagnostics):
+        raise AssertionError('cache-on candidate performed no actual prefix reuse')
+    write_json(directory/'diagnostics.json', diagnostics)
+    return [directory/f'{i:02d}-{row["id"]}.pt' for i,row in enumerate(rows)], {"hidden_size": h, "layers": list(layers), "draft_config": draft_config.to_dict()}, diagnostics
 
 
-def compare_features(args, rows, reference_paths, actual_paths, model_info, run_dir):
+def compare_features(args, rows, reference_paths, actual_paths, model_info, run_dir, diagnostics):
     import torch
     results = []
     for index,(row,reference_path,actual_path) in enumerate(zip(rows,reference_paths,actual_paths,strict=True)):
@@ -184,18 +199,12 @@ def compare_features(args, rows, reference_paths, actual_paths, model_info, run_
         for name in ('input_ids','loss_mask'):
             if not torch.equal(actual[name],reference[name]):
                 raise AssertionError(f'{row["id"]}: integer feature changed: {name}')
+        region_checks = feature_regions(actual,reference,L=diagnostics[index]['L'],layers=model_info['layers'],hidden_size=model_info['hidden_size'],rtol=args.feature_rtol,atol=args.feature_atol)
         for name in ('hidden_states','target_last_hidden_states'):
-            ranges = [('all',0,len(row['input_ids']))]
-            if name == 'hidden_states':
-                ranges += [(f'layer-{layer}',0,len(row['input_ids'])) for layer in model_info['layers']]
-            for label,start,end in ranges:
-                a,b=actual[name][:,start:end],reference[name][:,start:end]
-                if label.startswith('layer-'):
-                    layer_idx=model_info['layers'].index(int(label.split('-')[1])); h=model_info['hidden_size']
-                    a,b=a[...,layer_idx*h:(layer_idx+1)*h],b[...,layer_idx*h:(layer_idx+1)*h]
-                error=tensor_errors(a,b,rtol=args.feature_rtol,atol=args.feature_atol)
-                record={"case":row['id'],"feature":name,"range":label,**error}
-                append_json(run_dir/'feature-errors.jsonl',record);results.append(record)
+            region_checks.append({'feature':name,'region':'all',**tensor_errors(actual[name],reference[name],rtol=args.feature_rtol,atol=args.feature_atol)})
+        for check in region_checks:
+            record={"case":row['id'],"L":diagnostics[index]['L'],**check}
+            append_json(run_dir/'feature-errors.jsonl',record);results.append(record)
     if not all(record['passed'] for record in results):
         raise AssertionError('feature numerical comparison failed; see feature-errors.jsonl')
     return {"comparisons":len(results),"max_abs":max(v['max_abs'] for v in results),"max_relative_l2":max(v['relative_l2'] for v in results)}
@@ -242,6 +251,8 @@ def replay_gradients(args,cfg,resolved,rows,reference_paths,actual_paths,run_dir
     model=bundle.model.train()
     if model.num_anchors != 8 or not model.teacher_metrics:
         raise AssertionError('actual trainer requires eight anchors and teacher metrics')
+    checkpoint_checks=checkpoint_subset_audit(bundle,cfg.model.draft_checkpoint_path)
+    write_json(run_dir/'checkpoint-byte-audit.json',checkpoint_checks)
     before=model_digest(model)
     write_json(run_dir/'draft-initial.json',{"state_sha256":before,"checkpoint":cfg.model.draft_checkpoint_path,"draft_config":bundle.draft_config.to_dict(),
                                           "trainable_parameters":{name:list(p.shape) for name,p in model.named_parameters() if p.requires_grad}})
@@ -288,7 +299,10 @@ def replay_gradients(args,cfg,resolved,rows,reference_paths,actual_paths,run_dir
         restore_rng(after_rng)
         (ref_loss,ref_grads,ref_metrics),(loss,grads,metrics)=outputs
         loss_error=tensor_errors(loss,ref_loss,rtol=args.loss_rtol,atol=args.loss_atol)
-        numerator=denominator=0.;passed=loss_error['passed'];nonzero=0;parameter_records=[]
+        metric_checks=compare_metric_trees(metrics,ref_metrics,rtol=args.loss_rtol,atol=args.loss_atol)
+        if not any('/loss_terms/' in check['path'] for check in metric_checks) or not any('teacher/' in check['path'] for check in metric_checks):
+            raise AssertionError('loss numerator/denominator or teacher metrics were not actually evaluated')
+        numerator=denominator=0.;passed=loss_error['passed'] and all(check['passed'] for check in metric_checks);nonzero=0;parameter_records=[]
         for name,expected in ref_grads.items():
             actual=grads[name]
             if (actual is None)!=(expected is None):
@@ -309,7 +323,7 @@ def replay_gradients(args,cfg,resolved,rows,reference_paths,actual_paths,run_dir
         passed=passed and relative_l2<=args.gradient_relative_l2
         result={"index":index,"case":row['id'],"loss":float(loss),"reference_loss":float(ref_loss),"loss_error":loss_error,
                 "gradient_relative_l2":relative_l2,"nonzero_gradient_parameters":nonzero,"passed":passed,"parameters":parameter_records,
-                "reference_metrics":ref_metrics,"actual_metrics":metrics,"anchors":[[t.tolist() for t in call] for call in anchors]}
+                "reference_metrics":ref_metrics,"actual_metrics":metrics,"metric_comparisons":metric_checks,"anchors":[[t.tolist() for t in call] for call in anchors]}
         append_json(run_dir/'loss-gradient-results.jsonl',result)
         if not passed:
             torch.save({"reference":ref_grads,"actual":grads},run_dir/f'failure-gradients-{index:02d}.pt')
@@ -332,6 +346,8 @@ def main():
     parser.add_argument('--specforge-source',required=True);parser.add_argument('--sglang-source',required=True)
     parser.add_argument('--cases',required=True);parser.add_argument('--baseline-dir')
     parser.add_argument('--capture-only',action='store_true')
+    parser.add_argument('--require-cache',action='store_true',help='Require complete negotiated diagnostics and actual nonzero prefix reuse')
+    parser.add_argument('--replay-captures-from',help='Reuse a completed off/off run tensor artifact pair, starting no services')
     parser.add_argument('--feature-rtol',type=float,default=.02);parser.add_argument('--feature-atol',type=float,default=.02)
     parser.add_argument('--loss-rtol',type=float,default=.02);parser.add_argument('--loss-atol',type=float,default=.02)
     parser.add_argument('--gradient-rtol',type=float,default=.02);parser.add_argument('--gradient-atol',type=float,default=1e-5)
@@ -358,24 +374,40 @@ def main():
         # supported one-server/Mooncake services and drive every case directly.
         if sum(s.command.label.startswith('capture-server-') for s in plan.services)!=1:
             raise AssertionError('exactly one capture server required')
-        started=start_services(plan,run_dir)
-        if args.baseline_dir:
-            baseline=Path(args.baseline_dir)
-            prior=json.loads((baseline/'result.json').read_text())
-            if not prior.get('passed'):
-                raise AssertionError('candidate requires a completed passing off baseline')
-            reference=[baseline/'off-0'/f'{i:02d}-{r["id"]}.pt' for i,r in enumerate(rows)]
-            actual,info=capture_pass(args,cfg,resolved,plan,run_dir,'candidate',rows)
+        if args.replay_captures_from:
+            if args.baseline_dir or args.require_cache:
+                raise AssertionError('replay-only mode is for completed off/off evidence')
+            previous=Path(args.replay_captures_from)
+            if not json.loads((previous/'result.json').read_text()).get('passed'):
+                raise AssertionError('cannot replay an incomplete baseline')
+            if json.loads((previous/'cases.json').read_text()) != rows:
+                raise AssertionError('replay input cases differ from completed baseline')
+            reference=[previous/'off-0'/f'{i:02d}-{r["id"]}.pt' for i,r in enumerate(rows)]
+            actual=[previous/'off-1'/f'{i:02d}-{r["id"]}.pt' for i,r in enumerate(rows)]
+            info=json.loads((previous/'model-info.json').read_text())
+            diagnostics=[{'H':0,'L':0,'N':len(row['input_ids']),'span':[0,len(row['input_ids'])],'source':'saved official-only evidence'} for row in rows]
+            write_json(run_dir/'reused-evidence.json',{'source_run':str(previous),'reference':[str(p) for p in reference],'actual':[str(p) for p in actual]})
         else:
-            reference,info=capture_pass(args,cfg,resolved,plan,run_dir,'off-0',rows)
-            actual,info2=capture_pass(args,cfg,resolved,plan,run_dir,'off-1',rows)
-            if info!=info2:
-                raise AssertionError('capture schema changed between repeats')
+            started=start_services(plan,run_dir)
+            if args.baseline_dir:
+                baseline=Path(args.baseline_dir)
+                prior=json.loads((baseline/'result.json').read_text())
+                if not prior.get('passed'):
+                    raise AssertionError('candidate requires a completed passing off baseline')
+                if json.loads((baseline/'cases.json').read_text()) != rows:
+                    raise AssertionError('candidate input cases differ from completed baseline')
+                reference=[baseline/'off-0'/f'{i:02d}-{r["id"]}.pt' for i,r in enumerate(rows)]
+                actual,info,diagnostics=capture_pass(args,cfg,resolved,plan,run_dir,'candidate',rows)
+                if info!=json.loads((baseline/'model-info.json').read_text()):
+                    raise AssertionError('candidate capture/draft schema differs from completed baseline')
+            else:
+                reference,info,_=capture_pass(args,cfg,resolved,plan,run_dir,'off-0',rows)
+                actual,info2,diagnostics=capture_pass(args,cfg,resolved,plan,run_dir,'off-1',rows)
+                if info!=info2:
+                    raise AssertionError('capture schema changed between repeats')
+            _stop_services(started,grace_s=30);started=[]
         write_json(run_dir/'model-info.json',info)
-        # Release target resources before pretrained trainer replay; no overlap
-        # with another benchmark is authorized by this harness.
-        _stop_services(started,grace_s=30);started=[]
-        result['feature_comparison']=compare_features(args,rows,reference,actual,info,run_dir)
+        result['feature_comparison']=compare_features(args,rows,reference,actual,info,run_dir,diagnostics)
         if not args.capture_only:
             result['loss_gradient_comparison']=replay_gradients(args,cfg,resolved,rows,reference,actual,run_dir)
         result['capture_cases_per_pass']=len(rows);result['passed']=True
