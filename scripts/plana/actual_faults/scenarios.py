@@ -28,7 +28,11 @@ def command(directory, action, *, tp_size, timeout, **values):
     atomic_json(Path(directory) / 'command.json', {'id': identifier, 'action': action, **values})
     paths = [Path(directory) / f'ack-{identifier}-rank{rank}.json' for rank in range(tp_size)]
     wait_for(lambda: all(path.exists() for path in paths), timeout, 'all-rank test command acknowledgment')
-    return [read_json(path) for path in paths]
+    receipts = [read_json(path) for path in paths]
+    failures = [row for row in receipts if row.get('error')]
+    if failures:
+        raise RuntimeError('actual rank test command failed: '+json.dumps(failures))
+    return receipts
 
 
 def assert_cuda_cancel_receipts(rows, case_id, marker):
@@ -140,6 +144,28 @@ class Client:
                                                      target_repr='hidden_state', target_hidden_size=self.model['hidden_size'])
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='actual-fault-client')
         self.expected_keys = set()
+
+    def warm_ordinary_checkpoint(self, row, label):
+        """At most two exact-row normal requests; actual KV hit, unchanged HS."""
+        from specforge.inference.capture_protocol import CaptureProtocol
+        capability=CaptureProtocol(self.base_url,self.post,self.timeout).capability()
+        keys=('ready_blocks','ready_bytes','cache_bytes');probes=[]
+        for _ in range(2):
+            before=self.cleanup()
+            response=self.transport(self.base_url+'/generate',json_body={
+                'input_ids':list(row['input_ids']),'extra_key':capability['capture_namespace'],
+                'sampling_params':{'temperature':0.0,'max_new_tokens':0}},timeout=self.timeout)
+            after=self.cleanup();meta=response['meta_info'];cached=meta['cached_tokens']
+            unchanged=all(before['cache'][key]==after['cache'][key] for key in keys)
+            probe={'input_ids':list(row['input_ids']),'cached_tokens':cached,
+                   'has_spec_capture':'spec_capture' in meta,'hs_cache_unchanged':unchanged,
+                   'namespace':capability['capture_namespace'],'response':response}
+            probes.append(probe);atomic_json(self.directory/f'ordinary-kv-probes-{label}.json',probes)
+            if (type(cached) is not int or not 0<=cached<len(row['input_ids'])
+                    or probe['has_spec_capture'] or not unchanged):
+                raise AssertionError('ordinary KV prewarm changed HS or violated exact-row capture-free N-1 bounds')
+            if cached>0:return probes
+        raise AssertionError('bounded same-row ordinary prewarm did not prove an actual positive KV checkpoint')
 
     def task(self, task_id, row):
         from specforge.runtime.contracts import PromptTask
