@@ -143,6 +143,49 @@ class RuntimeContracts(unittest.TestCase):
         with self.assertRaises(Exception):future.result(timeout=10)
         self.zero_private(controller)
 
+    def test_exact_independent_budgets_include_passthrough_and_no_oversize_fallback(self):
+        controller=CaptureController(self.cache,self.schema,132,139,132);self.addCleanup(controller.shutdown,wait=True)
+        reservation=controller.try_reserve_output(self.execution,11,0,7)
+        self.assertEqual(controller.stats()['output_bytes'],139)
+        other=dataclasses.replace(self.execution,request_id='other')
+        self.assertIsNone(controller.try_reserve_output(other,1,0,0))
+        controller.release_output(reservation);controller.release_output(reservation);self.zero_private(controller)
+        with self.assertRaises(ValueError):controller.try_reserve_output(other,11,0,8)
+        self.zero_private(controller)
+        small=CaptureController(self.cache,self.schema,60,132,60);self.addCleanup(small.shutdown,wait=True)
+        valid=small.try_reserve_output(self.execution,11,6,0);self.assertIsNotNone(valid);small.release_output(valid);self.zero_private(small)
+        with self.assertRaises(ValueError):small.try_reserve_output(other,11,0,0)
+        self.zero_private(small)
+
+    def test_cache_too_small_skips_fill_without_losing_complete_delivery(self):
+        cache=PrefixFeatureCache(self.schema,chunk_tokens=4,capacity_bytes=self.block_bytes-1)
+        controller=CaptureController(cache,self.schema,4096,4096,4096);self.addCleanup(controller.shutdown,wait=True)
+        lease=cache.lookup_and_pin(self.ns,self.tokens,11)
+        reservation=controller.try_reserve_output(self.execution,11,0,0)
+        plan=controller.freeze_plan(self.execution,self.ns,self.tokens,11,0,lease,reservation)
+        sample=controller.submit(plan,CapturedSpan(self.execution,0,11,self.values(),None)).result(timeout=10)
+        for name,value in sample.features.items():torch.testing.assert_close(value,self.values()[name],rtol=0,atol=0)
+        sample.release();controller.poll_completed();controller.poll_drained()
+        self.assertEqual(cache.stats()['ready_blocks'],0);self.assertEqual(cache.stats()['cache_bytes'],0)
+        self.assertGreater(cache.stats()['fill_skips'],0);self.zero_private(controller)
+
+    def test_same_key_concurrent_fill_has_one_committer(self):
+        key=self.cache.block_keys(self.ns,self.tokens)[0];start=threading.Barrier(3);finish=threading.Barrier(3);fills=[];errors=[]
+        def reserve(index):
+            try:
+                start.wait(timeout=5)
+                fills.append(self.cache.reserve_fill(key,dataclasses.replace(self.execution,request_id=f'writer-{index}')))
+                finish.wait(timeout=5)
+            except BaseException as exc:errors.append(exc)
+        workers=[threading.Thread(target=reserve,args=(i,)) for i in range(2)]
+        for worker in workers:worker.start()
+        start.wait(timeout=5);finish.wait(timeout=5)
+        for worker in workers:worker.join(timeout=5);self.assertFalse(worker.is_alive())
+        self.assertEqual(errors,[]);owners=[fill for fill in fills if fill is not None];self.assertEqual(len(owners),1)
+        self.assertTrue(self.cache.publish_ready(owners[0],{k:v[:4].clone() for k,v in self.values().items()}))
+        self.cache.abort_fill(owners[0]);self.assertEqual(self.cache.stats()['ready_blocks'],1)
+        self.assertEqual(self.cache.stats()['fill_reservations'],0)
+
     def test_stale_epoch_or_short_span_rejected_before_materialization(self):
         for mode in ('epoch','start','end','feature'):
             controller=self.controller();execution=ExecutionIdentity('server-a',mode,mode,0);plan=self.plan(controller,execution=execution)
