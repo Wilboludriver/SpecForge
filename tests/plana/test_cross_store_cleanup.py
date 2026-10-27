@@ -120,6 +120,31 @@ class CrossStoreCleanup(unittest.TestCase):
         self.assert_replacement(11.)
         self.assertEqual(self.bridge.registry.lookup(replacement).attempt_id,'attempt-b')
 
+    def test_lost_begin_reply_recovers_same_intent_before_cleanup_and_retry(self):
+        from specforge.inference.capture_protocol import CaptureProtocol
+        lost=[True];seen=[]
+        def transport(url,*,json_body,timeout):
+            reply=self.control(url,json_body=json_body,timeout=timeout)
+            if json_body['action']=='begin':
+                seen.append((json_body['attempt_id'],json_body['request_digest'],reply['reservation_token']))
+                if lost[0]:
+                    lost[0]=False
+                    raise TimeoutError('injected lost begin response after server registration')
+            return reply
+        protocol=CaptureProtocol('http://fake',transport,.1)
+        payload={'store_id':'shared-store','sample_id':'same-sample','gen':1,'features':{'aux':'hidden_states'},'passthrough':[]}
+        store=MooncakeFeatureStore(store=self.backend,store_id='shared-store');self.stores.append(store)
+        with self.assertRaises(TimeoutError):
+            store.begin_capture_attempt(protocol,{'server_epoch':'epoch'},payload,(1,2,3,4),'begin-attempt',['hidden_states'])
+        self.assertEqual(len(self.bridge.registry.active),1)
+        self.assertIn('same-sample',store._capture_pending_begin)
+        store.prepare_capture_retry('same-sample')
+        self.assertEqual(len(seen),2);self.assertEqual(seen[0],seen[1],'lost begin recovery changed attempt or token')
+        self.assertEqual(store._capture_pending_begin,{})
+        self.assertEqual(len(self.bridge.registry.active),0)
+        self.assertEqual(store.health()['provisional_external'],0)
+        self.begin('replacement-after-recovered-begin')
+
     def test_unknown_old_server_state_fails_closed_before_delete(self):
         old,ref,producer,consumer=self.new_old_pair()
         self.bridge.registry.tokens.clear();self.bridge.registry.active.clear();self.bridge.registry.retired.clear()
