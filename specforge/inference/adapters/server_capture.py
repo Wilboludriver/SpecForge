@@ -168,6 +168,7 @@ class SGLangServerCaptureAdapter:
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
         server_capture: str = "patch",
+        control_fn: Optional[Callable[..., Any]] = None,
     ) -> None:
         if server_capture not in SERVER_CAPTURE_BACKENDS:
             raise ValueError(
@@ -206,6 +207,11 @@ class SGLangServerCaptureAdapter:
         self.request_input_adapter = request_input_adapter
         self.timeout_s = timeout_s
         self.post_fn = post_fn or _SessionPost()
+        # Explicit legacy test transports need not implement a new endpoint.
+        # Real HTTP negotiates automatically; injected transports opt in with control_fn.
+        from specforge.inference.capture_protocol import CaptureProtocol
+        control = control_fn if control_fn is not None else (self.post_fn if post_fn is None else None)
+        self._capture_protocol = CaptureProtocol(base_url, control, timeout_s) if control is not None and server_capture == "patch" else None
         self.target_model_version = target_model_version
         self.server_capture = server_capture
         self._capture_hint = (
@@ -354,6 +360,14 @@ class SGLangServerCaptureAdapter:
                 ),
             },
         )
+        if result.get("protocol_version") == 1:
+            ref.metadata["capture_fence"] = {
+                **{name: result[name] for name in ("server_epoch", "store_id", "sample_id", "gen", "attempt_id", "reservation_token")},
+                "protocol_version": 1, "control_url": self.base_url + "/spec_capture/control",
+                "timeout_s": self.timeout_s,
+            }
+            ref.metadata["capture_diagnostics"] = {name: result.get(name) for name in
+                ("H", "L", "N", "span", "execution_epoch", "rank", "reused_tokens", "capture_namespace", "capture_signature", "timings")}
         if "arena" in result:
             # Arena objects stay on the capture server; currently only online
             # NVLink capture uses the arena.
@@ -387,6 +401,30 @@ class SGLangServerCaptureAdapter:
         body["extra_key"] = [uuid.uuid4().hex for _ in tasks]
         sampling_params = {"temperature": 0.0, "max_new_tokens": 0}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
+        capability = self._capture_protocol.capability() if self._capture_protocol is not None else None
+        if capability is not None:
+            required = ("prepare_capture_retry", "track_capture_fence")
+            if any(not callable(getattr(self.store, name, None)) for name in required):
+                raise TypeError("negotiated capture requires attempt-fenced store")
+            requested_layers = tuple(capture.aux_hidden_state_layer_ids or ())
+            schema = {item["name"]: item for item in capability["schema"]}
+            if requested_layers and schema.get("aux", {}).get("width") != capture.expected_aux_width:
+                raise CaptureMismatchError("server capability aux width mismatch")
+            if self.schema.last_hidden_feature is not None and schema.get("last_hidden", {}).get("width") != capture.target_hidden_size:
+                raise CaptureMismatchError("server capability last hidden width mismatch")
+            if requested_layers and tuple(schema.get("aux", {}).get("layer_ids", ())) != requested_layers:
+                raise CaptureMismatchError("server capability aux layer order mismatch")
+            for task, payload in zip(tasks, capture_payloads):
+                self.store.prepare_capture_retry(payload["sample_id"])
+                attempt_id = uuid.uuid4().hex
+                names = [*payload["features"].values(), *(x["name"] for x in payload.get("passthrough", ()))]
+                fence = self.store.begin_capture_attempt(self._capture_protocol, capability, payload, task.payload["input_ids"], attempt_id, names)
+                payload.update({name: capability[name] for name in ("server_epoch", "capture_namespace", "capture_signature")})
+                payload.update({name: fence[name] for name in ("protocol_version", "attempt_id", "reservation_token")})
+                names = [*payload["features"].values(), *(x["name"] for x in payload.get("passthrough", ()))]
+                self.store.track_capture_fence(fence, names, control_fn=self._capture_protocol.post)
+            if capability["cache_enabled"]:
+                body["extra_key"] = [capability["capture_namespace"]] * len(tasks)
         if self.server_capture == "plugin":
             # custom_params values must be JSON scalars, so the spec travels
             # as one JSON string per request.
@@ -424,7 +462,7 @@ class SGLangServerCaptureAdapter:
             )
         out: List[Union[Any, ServerCaptureFailure]] = []
         successful_refs = []
-        for task, row in zip(tasks, rows):
+        for task, row, payload in zip(tasks, rows, capture_payloads):
             if not isinstance(row, dict):
                 raise RuntimeError(
                     "spec-capture server returned a non-object row for task "
@@ -475,6 +513,14 @@ class SGLangServerCaptureAdapter:
                     f"task {task.task_id}: {actual_identity} != "
                     f"{expected_identity}"
                 )
+            if capability is not None:
+                for name in ("protocol_version", "server_epoch", "capture_namespace", "capture_signature", "attempt_id", "reservation_token"):
+                    if result.get(name) != payload.get(name):
+                        raise RuntimeError("negotiated capture response identity mismatch: " + name)
+                if capability["cache_enabled"]:
+                    N, L = len(task.payload["input_ids"]), result.get("L")
+                    if not isinstance(L, int) or not 0 <= L < N or result.get("N") != N or result.get("span") != [L, N]:
+                        raise RuntimeError("negotiated capture returned invalid absolute span")
             ref = self._ref_from_result(task, result, capture)
             # A capture shorter than the prompt is corrupt: it means cache
             # isolation or another full-prefill invariant failed despite the
