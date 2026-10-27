@@ -264,10 +264,11 @@ class RankState:
         del self.fixture_pins[key]
 
     def probe_kv(self, tokens):
+        from array import array
         from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
         from sglang.srt.mem_cache.radix_cache import RadixKey
         return self.scheduler.tree_cache.match_prefix(MatchPrefixParams(
-            key=RadixKey(list(tokens), extra_key=self.bridge.namespace, limit=max(len(tokens)-1, 0)),
+            key=RadixKey(array('q',tokens), extra_key=self.bridge.namespace, limit=max(len(tokens)-1, 0)),
             cow_mamba=False, req=None))
 
     def wrap_admit(self, original, req, adder, *args, **kwargs):
