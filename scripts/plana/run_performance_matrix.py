@@ -427,7 +427,8 @@ def self_test(matrix):
     import tempfile
     from unittest import mock
     rows=cases(matrix,None,None,include_fallback=True)
-    assert len(rows)==40 and sum(row['transport']=='rdma' for row in rows)==24
+    workload_count=sum(len(model['workloads']) for model in matrix['models'])
+    assert len(rows)==workload_count*5 and sum(row['transport']=='rdma' for row in rows)==workload_count*3
     assert len(cases(matrix,{'qwen3-4b'},None))==12
     assert len(cases(matrix,{'qwen3-4b'},{'hot'},3))==9
     assert all(row['group']!='device-off' for row in rows if row['transport']=='tcp')
