@@ -27,7 +27,7 @@ import traceback
 from unittest import mock
 
 from extended_checks import (checkpoint_subset_audit, compare_metric_trees, extract_capture_result, feature_regions, validate_diagnostics)
-from validation_helpers import (append_json, file_sha256, load_cases,
+from validation_helpers import (append_json, canonical_model_info, file_sha256, load_cases,
                                 tensor_errors, tensor_sha256, validate_features, write_json)
 
 
@@ -227,7 +227,9 @@ def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
     if args.require_cache and not any(d['L'] > 0 for d in diagnostics):
         raise AssertionError('cache-on candidate performed no actual prefix reuse')
     write_json(directory/'diagnostics.json', diagnostics)
-    return [directory/f'{i:02d}-{row["id"]}.pt' for i,row in enumerate(rows)], {"hidden_size": h, "layers": list(layers), "draft_config": draft_config.to_dict()}, diagnostics
+    info=canonical_model_info({"hidden_size": h, "layers": list(layers), "draft_config": draft_config.to_dict()})
+    write_json(directory/'model-info.json',info)
+    return [directory/f'{i:02d}-{row["id"]}.pt' for i,row in enumerate(rows)], info, diagnostics
 
 
 def compare_features(args, rows, reference_paths, actual_paths, model_info, run_dir, diagnostics):
@@ -438,7 +440,8 @@ def main():
                     raise AssertionError('candidate input cases differ from completed baseline')
                 reference=[baseline/'off-0'/f'{i:02d}-{r["id"]}.pt' for i,r in enumerate(rows)]
                 actual,info,diagnostics=capture_pass(args,cfg,resolved,plan,run_dir,'candidate',rows)
-                if info!=json.loads((baseline/'model-info.json').read_text()):
+                write_json(run_dir/'model-info.json',info)
+                if canonical_model_info(info)!=canonical_model_info(json.loads((baseline/'model-info.json').read_text())):
                     raise AssertionError('candidate capture/draft schema differs from completed baseline')
             else:
                 reference,info,_=capture_pass(args,cfg,resolved,plan,run_dir,'off-0',rows)

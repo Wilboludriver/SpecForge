@@ -15,6 +15,17 @@ def append_json(path, value):
         stream.write(json.dumps(value, sort_keys=True, allow_nan=False) + "\n")
 
 
+
+def canonical_model_info(info):
+    """Preserve every model/schema value in its persisted JSON representation.
+
+    HF config dictionaries use integer id2label keys in memory, while the JSON
+    evidence necessarily stores those keys as strings. Compare both forms
+    through the same complete serialization boundary; never filter fields.
+    """
+    return json.loads(json.dumps(info,sort_keys=True,allow_nan=False))
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:

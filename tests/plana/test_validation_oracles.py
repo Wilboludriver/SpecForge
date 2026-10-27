@@ -51,6 +51,21 @@ class TestIndependentOracles(unittest.TestCase):
         with self.assertRaises(AssertionError):helpers.validate_features(values,self.row(),hidden_size=2,layers=[1,3,5])
         with self.assertRaises(AssertionError):helpers.tensor_errors(torch.tensor([float('inf')]),torch.ones(1),rtol=.02,atol=.02)
 
+    def test_entire_model_info_roundtrip_keeps_keys_and_rejects_changed_schema_values(self):
+        import copy,json
+        info={'hidden_size':2560,'layers':[1,9,17,25,33],
+              'draft_config':{'id2label':{0:'LABEL_0',1:'LABEL_1'},'hidden_size':2560,'num_hidden_layers':5}}
+        persisted=json.loads(json.dumps(info))
+        self.assertNotEqual(info,persisted)
+        self.assertEqual(helpers.canonical_model_info(info),persisted)
+        for mode in ('capture-layer','draft-width','label-value','new-field'):
+            changed=copy.deepcopy(info)
+            if mode=='capture-layer':changed['layers'][1]=8
+            elif mode=='draft-width':changed['draft_config']['hidden_size']=2048
+            elif mode=='label-value':changed['draft_config']['id2label'][0]='CHANGED'
+            else:changed['draft_config']['unexpected_capture_transform']='different'
+            with self.subTest(mode=mode):self.assertNotEqual(helpers.canonical_model_info(changed),persisted)
+
     def test_success_preserves_exact_complete_sample(self):
         values=self.features();helpers.validate_features(values,self.row(),hidden_size=2,layers=[1,3,5])
         self.assertTrue(helpers.tensor_errors(values['hidden_states'],values['hidden_states'].clone(),rtol=0,atol=0)['passed'])
