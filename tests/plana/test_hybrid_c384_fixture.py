@@ -18,7 +18,9 @@ class HybridC384OracleTests(unittest.TestCase):
                    'later_checkpoint_probe': {'probes': [
                        {'input_ids': cases[2]['input_ids'], 'cached_tokens': 256, 'has_spec_capture': False, 'hs_cache_unchanged': True},
                        {'input_ids': cases[2]['input_ids'], 'cached_tokens': 448, 'has_spec_capture': False, 'hs_cache_unchanged': True}]},
-                   'ordinary_uncaptured_kv': {'cached_tokens': 960, 'has_spec_capture': False, 'hs_cache_unchanged': True}}
+                   'ordinary_uncaptured_kv': {'probes': [
+                       {'input_ids': cases[6]['input_ids'], 'cached_tokens': 0, 'has_spec_capture': False, 'hs_cache_unchanged': True},
+                       {'input_ids': cases[6]['input_ids'], 'cached_tokens': 960, 'has_spec_capture': False, 'hs_cache_unchanged': True}]}}
         return cases, diagnostics, actions
 
     def test_actual_restore_is_recorded_without_forcing_an_arithmetic_grid(self):
@@ -35,10 +37,23 @@ class HybridC384OracleTests(unittest.TestCase):
             if mode == 'maximal-L': diagnostics[2]['L'] = diagnostics[2]['H']
             elif mode == 'flush-reuse': diagnostics[4]['L'] = 64
             elif mode == 'lost-HS': actions['engine_flush']['hs_cache_unchanged'] = False
-            elif mode == 'no-KV': actions['ordinary_uncaptured_kv']['cached_tokens'] = 0
-            elif mode == 'captured-KV': actions['ordinary_uncaptured_kv']['has_spec_capture'] = True
-            elif mode == 'KV-changes-HS': actions['ordinary_uncaptured_kv']['hs_cache_unchanged'] = False
+            elif mode == 'no-KV': actions['ordinary_uncaptured_kv']['probes'][-1]['cached_tokens'] = 0
+            elif mode == 'captured-KV': actions['ordinary_uncaptured_kv']['probes'][-1]['has_spec_capture'] = True
+            elif mode == 'KV-changes-HS': actions['ordinary_uncaptured_kv']['probes'][-1]['hs_cache_unchanged'] = False
             else: actions['later_checkpoint_probe']['probes'][-1]['cached_tokens'] = 384
+            with self.subTest(mode=mode), self.assertRaises(AssertionError):
+                fixture.validate_outcome(cases, diagnostics, actions)
+
+    def test_KV_only_requires_observed_hit_after_at_most_two_unchanged_HS_probes(self):
+        cases, diagnostics, actions = self.evidence()
+        fixture.validate_outcome(cases, diagnostics, actions)
+        for mode in ('first-HS-mutation', 'wrong-tokens', 'N-minus1-violation', 'third-probe'):
+            cases, diagnostics, actions = self.evidence()
+            probes = actions['ordinary_uncaptured_kv']['probes']
+            if mode == 'first-HS-mutation': probes[0]['hs_cache_unchanged'] = False
+            elif mode == 'wrong-tokens': probes[-1]['input_ids'] = [2] * 1024
+            elif mode == 'N-minus1-violation': probes[-1]['cached_tokens'] = 1024
+            else: probes.append(dict(probes[-1]))
             with self.subTest(mode=mode), self.assertRaises(AssertionError):
                 fixture.validate_outcome(cases, diagnostics, actions)
 

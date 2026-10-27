@@ -37,6 +37,19 @@ def cache_capacity_bytes(info):
     return CAPACITY_CHUNKS * CHUNK_TOKENS * 2 * info['hidden_size'] * (len(info['layers']) + 1)
 
 
+def validate_ordinary_probes(action, row, *, lower_bound):
+    probes = action['probes']
+    N = len(row['input_ids'])
+    if not 1 <= len(probes) <= 2:
+        raise AssertionError('checkpoint proof requires one or two bounded ordinary probes')
+    for probe in probes:
+        if (probe['input_ids'] != row['input_ids'] or not 0 <= probe['cached_tokens'] < N
+                or probe['has_spec_capture'] or not probe['hs_cache_unchanged']):
+            raise AssertionError('ordinary probe changed request identity, legality or HS cache')
+    if not lower_bound < probes[-1]['cached_tokens'] < N:
+        raise AssertionError('ordinary request did not prove a sufficient usable engine checkpoint')
+
+
 def validate_outcome(cases, diagnostics, actions):
     """Do not invent a maximal legal L: assert actual bounded restore and causes."""
     expected_h = [0, 0, 384, 768, 768, 0, 0]
@@ -54,21 +67,10 @@ def validate_outcome(cases, diagnostics, actions):
         raise AssertionError('engine flush did not force HS-only restore to L0')
     if diagnostics[6]['L'] != 0:
         raise AssertionError('KV-only fixture reused a missing HS prefix')
-    later = actions['later_checkpoint_probe']
-    probes = later['probes']
-    N = len(cases[2]['input_ids'])
-    if not 1 <= len(probes) <= 2:
-        raise AssertionError('later checkpoint proof requires one or two bounded ordinary probes')
-    for probe in probes:
-        if (probe['input_ids'] != cases[2]['input_ids'] or not 0 <= probe['cached_tokens'] < N
-                or probe['has_spec_capture'] or not probe['hs_cache_unchanged']):
-            raise AssertionError('later checkpoint probe changed bounded request identity, legality or HS cache')
-    if not diagnostics[2]['H'] < probes[-1]['cached_tokens'] < N:
-        raise AssertionError('bounded-H fixture did not prove a later ordinary usable engine checkpoint')
-    flush, ordinary = actions['engine_flush'], actions['ordinary_uncaptured_kv']
+    validate_ordinary_probes(actions['later_checkpoint_probe'], cases[2], lower_bound=diagnostics[2]['H'])
+    flush = actions['engine_flush']
     if flush['status'] != 200 or not flush['hs_cache_unchanged']:
         raise AssertionError('HS-only fixture did not preserve ready HS across engine flush')
-    if not ordinary['cached_tokens'] > 0 or ordinary['has_spec_capture'] or not ordinary['hs_cache_unchanged']:
-        raise AssertionError('ordinary request did not prove uncaptured KV availability')
+    validate_ordinary_probes(actions['ordinary_uncaptured_kv'], cases[6], lower_bound=0)
     return {'actual_H': [d['H'] for d in diagnostics], 'actual_L': [d['L'] for d in diagnostics],
             'bounded_checkpoint': diagnostics[2], 'hs_only': diagnostics[4], 'kv_only': diagnostics[6]}
