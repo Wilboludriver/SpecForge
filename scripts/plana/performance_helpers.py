@@ -182,14 +182,25 @@ def validate_rdma_proof(proof, *, expected_devices=None):
     return True
 
 
+def performance_run_id(run_dir):
+    """Stable identity for one exclusive run directory, including every parent.
+
+    The runner creates this directory with exist_ok=False. Retries must use a
+    new directory; model/workload/repetition/group leaf names alone are not IDs.
+    """
+    root = Path(run_dir).resolve()
+    digest = hashlib.sha256(os.fsencode(root)).hexdigest()
+    return f'plana-perf-{digest}'
+
+
 def isolate_config(original, *, run_dir, workload, group, transport, cache_bytes, chunk_tokens, rdma_devices):
     if group not in GROUPS or transport not in ('tcp', 'rdma'):
         raise ValueError('unsupported comparison group/transport')
     if group == 'device-off' and transport != 'rdma':
         raise ValueError('TCP can never be labelled device publication')
     cfg = copy.deepcopy(original)
-    root = Path(run_dir)
-    cfg['run_id'], cfg['output_dir'] = root.name, str(root / 'output')
+    root = Path(run_dir).resolve()
+    cfg['run_id'], cfg['output_dir'] = performance_run_id(root), str(root / 'output')
     cfg['data']['prompts_path'], cfg['data']['cache_dir'] = str(root / 'training.jsonl'), str(root / 'data-cache')
     cfg['training'].update(seed=42, batch_size=1, accumulation_steps=1, num_anchors=8,
                            dflash_teacher_metrics=True, num_epochs=1, log_interval=1,
@@ -198,6 +209,7 @@ def isolate_config(original, *, run_dir, workload, group, transport, cache_bytes
         raise ValueError('performance template must disable evaluation')
     cfg['tracking']['report_to'] = 'none'
     disagg = cfg['deployment']['disaggregated']
+    disagg['store_id'] = cfg['run_id']
     cfg.setdefault('runtime', {})['producer_concurrency'] = 1
     disagg['control_dir'], disagg['consumer_state_dir'] = str(root / 'control'), str(root / 'consumer-state')
     managed = disagg['managed_local']
@@ -508,6 +520,7 @@ def comparison_contract(config, workload_sha, schema, cache_bytes, chunk_tokens)
     value['data']['prompts_path'] = workload_sha
     value['data']['cache_dir'] = '<isolated>'
     disagg = value['deployment']['disaggregated']
+    disagg['store_id'] = '<isolated>'
     for key in ('control_dir', 'consumer_state_dir'):
         disagg[key] = '<isolated>'
     for owner, key in [(value['model'], 'sglang_extra_args')] + [(s, 'extra_args') for s in disagg['managed_local']['capture_servers']]:

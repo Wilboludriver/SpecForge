@@ -31,7 +31,7 @@ from performance_helpers import (GROUPS, WORKLOADS, OFFICIAL_PATCH_SHA256, Proce
     aggregate_capture, aggregate_training, append_json, build_workload, canonical_digest,
     comparison_contract, compare_runs, content_fingerprint, isolate_config, load_rows, rewrite_capture_argv,
     rewrite_worker_argv, validate_rdma_proof, write_json, optimizer_step_number,
-    serialize_for_epoch_order, audit_consumed_order, assigned_gpu_indices)
+    serialize_for_epoch_order, audit_consumed_order, assigned_gpu_indices, performance_run_id)
 
 OFFICIAL_SF = '716b02d7bf886cf5761685c0e57de887814ff15f'
 OFFICIAL_SG = '74be0a60ebfcc7d8e261096bca445ac51e383f03'
@@ -410,14 +410,15 @@ def warm_server(run_dir, cfg, resolved, server, workload):
     layout = resolve_server_capture_layout(resolved.algorithm,cfg,modality='text')
     capture_schema = ServerCaptureSchema(aux_feature=layout.aux_feature,last_hidden_feature=layout.last_hidden_feature,
         passthrough=layout.passthrough,attention_mask_feature=layout.attention_mask_feature)
-    store = MooncakeFeatureStore(store_id=Path(run_dir).name+'-prewarm',setup_kwargs=_setup_from_env(server.command.env))
-    adapter = SGLangServerCaptureAdapter(server.command.env['DISAGG_SERVER_URLS'],store,run_id=Path(run_dir).name+'-prewarm',
+    prewarm_id = performance_run_id(run_dir)+'-prewarm'
+    store = MooncakeFeatureStore(store_id=prewarm_id,setup_kwargs=_setup_from_env(server.command.env))
+    adapter = SGLangServerCaptureAdapter(server.command.env['DISAGG_SERVER_URLS'],store,run_id=prewarm_id,
         algorithm='dflash',schema=capture_schema,server_capture='patch')
     contract=CaptureConfig.from_strategy(required_features={'input_ids','loss_mask','hidden_states','target_last_hidden_states'},
         aux_hidden_state_layer_ids=tuple(schema['layers']),target_repr='hidden_state',target_hidden_size=schema['hidden_size'])
     try:
         for index,row in enumerate(workload['prewarm']):
-            task=PromptTask(task_id=f'prewarm-{index:05d}',run_id=Path(run_dir).name+'-prewarm',source_id='performance-warmup',
+            task=PromptTask(task_id=f'prewarm-{index:05d}',run_id=prewarm_id,source_id='performance-warmup',
                 payload={key:row[key] for key in ('input_ids','loss_mask')},max_length=len(row['input_ids']))
             ref,=adapter.produce_refs([task],capture=contract)
             if not isinstance(ref,SampleRef):
@@ -514,7 +515,8 @@ def rdma_cuda_probe(env, output):
     aux=torch.arange(128,device='cuda',dtype=torch.float32).reshape(32,4).to(torch.bfloat16)
     hidden=aux[:,:2].contiguous()
     cuda_ptrs={aux.untyped_storage().data_ptr(),hidden.untyped_storage().data_ptr()}
-    sid='cuda-proof-'+str(os.getpid());store_id='plana-proof-'+str(os.getpid())
+    store_id=performance_run_id(Path(output).parent)+'-rdma-proof'
+    sid=store_id+':cuda-proof'
     names=('hidden_states','target_last_hidden_states')
     sink=store=handle=None
     writer_finished=read_started=read_finished=False
@@ -556,6 +558,7 @@ def rdma_cuda_probe(env, output):
         store.release(handle);handle=None;store.drain_sample_removals([sid])
         removed=all(not store._store_exists(store._tkey(sid,1,name)) for name in names)
         proof={'protocol':'rdma','gpu_put':True,'cuda_source':aux.is_cuda and hidden.is_cuda,
+            'run_id':store_id,'store_id':store_id,'sample_id':sid,
             'cuda_register_status':0 if len(registrations)==2 and all(value==0 for value in registrations) else -1,
             'put_status':0 if puts and all(value is None or int(value)==0 for value in puts) else -1,
             'fetch_equal':equal,'keys_removed':removed,'rdma_devices':env['MOONCAKE_RDMA_DEVICES'],
@@ -647,11 +650,14 @@ def final_server_and_keys(plan, run_dir):
                 (controller['output_peak_bytes'],limits['output_bytes']),
                 (controller['device_peak_bytes'],limits['device_bytes'])):
                 if value>limit:raise AssertionError('actual cache/controller hard budget exceeded')
-    store=MooncakeFeatureStore(store_id='plana-final-inspection',setup_kwargs=_setup_from_env(server.command.env))
+    run_id=performance_run_id(run_dir)
+    store=MooncakeFeatureStore(store_id=run_id+'-inspection',setup_kwargs=_setup_from_env(server.command.env))
     remaining=[];key_count=0
     try:
         for row in _load_events(run_dir,'captures'):
             ref=row['ref'];store_id=ref['feature_store_uri'].split('://',1)[1].split('/',1)[0]
+            if ref['run_id']!=run_id or store_id!=run_id or not ref['sample_id'].startswith(run_id+':'):
+                raise AssertionError('actual sample escaped the isolated run/store namespace')
             for name in ref['feature_specs']:
                 key=f"{store_id}/{ref['sample_id']}/g1/{name}";key_count+=1
                 if store._store_exists(key):remaining.append(key)
@@ -900,6 +906,11 @@ def main(argv=None):
         write_json(run_dir/'manifest.json',{'comparison_contract': comparison_contract(cfg_dict,workload['data_sha256'],schema,args.cache_bytes,args.chunk_tokens), 'specforge':sf,'sglang':sg,'schema':schema,'data_sha256':workload['data_sha256'],
             'intended_data_sha256':workload['intended_data_sha256'],'prompt_seed':workload['prompt_seed'],
             'producer_concurrency':cfg.runtime.producer_concurrency,
+            'run_identity':{'run_dir':str(run_dir),'run_id':cfg.run_id,
+                'store_id':cfg_dict['deployment']['disaggregated']['store_id'],
+                'prewarm_id':performance_run_id(run_dir)+'-prewarm',
+                'rdma_proof_id':performance_run_id(run_dir)+'-rdma-proof',
+                'inspection_id':performance_run_id(run_dir)+'-inspection'},
             'template_sha256':hashlib.sha256(Path(args.config).read_bytes()).hexdigest(),'argv':raw,
             'python':sys.executable,'harness_sha256':hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
             'helpers_sha256':hashlib.sha256(SCRIPT.with_name('performance_helpers.py').read_bytes()).hexdigest(),
