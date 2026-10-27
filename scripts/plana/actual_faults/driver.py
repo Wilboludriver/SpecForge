@@ -174,8 +174,7 @@ def run(config, directory):
             result['cases'].append(run_case(client,directory,query))
             result['source_unchanged']=manifest==source_manifest(config)
             if not result['source_unchanged']:raise AssertionError('production/test source changed during concurrent-fill run')
-            atomic_json(directory/'driver-stop.json', {'stop':True})
-            script_future.result(timeout=client.timeout)
+            # Finally must finish HTTP cleanup/close before stopping the driver.
             result['passed']=True
             return result
         golden, _ = client.fetch(client.submit('golden-query',query,force_full=True)[0], query)
@@ -340,8 +339,7 @@ def run(config, directory):
         result['source_unchanged']=manifest==source_manifest(config)
         if not result['source_unchanged']:
             raise AssertionError('production/test source changed during actual-engine run')
-        atomic_json(directory/'driver-stop.json', {'stop':True})
-        script_future.result(timeout=timeout)
+        # The final cleanup/close still needs the active scripted engine.
         result['passed']=True
     except BaseException as exc:
         import traceback
