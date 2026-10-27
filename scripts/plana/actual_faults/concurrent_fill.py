@@ -185,11 +185,11 @@ class _Observer:
     def submit(self,original,plan,span):
         actor,arm=self.actor(plan.execution.request_id)
         if actor is None:return original(plan,span)
-        self.executions[actor]=execution_wire(plan.execution)
-        self.plans[actor]={'namespace':plan.namespace,'token_sha256':token_digest(plan.tokens),'N':plan.N,'L':plan.L,
-            'schema_signature':plan.schema_signature,'key':key_wire(self.bridge.cache.block_keys(plan.namespace,plan.tokens)[0])}
         good=False
         try:
+            self.executions[actor]=execution_wire(plan.execution)
+            self.plans[actor]={'namespace':plan.namespace,'token_sha256':token_digest(plan.tokens),'N':plan.N,'L':plan.L,
+                'schema_signature':plan.schema_signature,'key':key_wire(self.bridge.cache.block_keys(plan.namespace,plan.tokens)[0])}
             future=original(plan,span)
             info=self.plans[actor];cuda=all(value.is_cuda for value in span.features.values()) and set(span.features)=={'aux','last_hidden'}
             event=span.ready_event
@@ -223,8 +223,10 @@ class _Observer:
         finally:
             if actor=='B':
                 self.auto_release=good
-                self.emit('cf_gate_release',actor,arm,reason='verified_b_submit' if good else 'b_submit_error')
-                self.gate.set()  # Before result-queue pending-batches=2 can block owner commands.
+                try:
+                    self.emit('cf_gate_release',actor,arm,reason='verified_b_submit' if good else 'b_submit_error')
+                finally:
+                    self.gate.set()  # Receipt I/O cannot strand the actual worker gate.
 
 
 def guarded_cpu_copy(original,target,source,*args,**kwargs):
@@ -317,6 +319,11 @@ def assert_receipts(rows,arm,tp_size=2):
         owned=[r for r in reserves if r['actor']==actor]
         require(sorted(r['key']['start'] for r in owned)==expected_starts,'missing or duplicated actual fill attempts')
     require(len(commits)==5 and all(r['actor']=='A' and r['published'] for r in commits),'not exactly one A committer per complete chunk')
+    a_reservations=[r for r in reserves if r['actor']=='A']
+    key_id=lambda row:json.dumps(row['key'],sort_keys=True,separators=(',',':'))
+    require(Counter(map(key_id,commits))==Counter(map(key_id,a_reservations)),
+            'commits do not cover every distinct reserved content key exactly once')
+    require(len({r['fill_id'] for r in a_reservations})==5,'A reused a fill reservation across keys')
     for committed in commits:
         key=committed['key'];owners=[r for r in reserves if r['key']==key]
         require(len(owners)==2,'content key differs or extra reservation observed')

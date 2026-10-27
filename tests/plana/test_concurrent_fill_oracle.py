@@ -82,6 +82,16 @@ class ReceiptTests(unittest.TestCase):
             with self.subTest(event=row['event'],actor=row['actor'],rank=row['rank']):
                 with self.assertRaises(AssertionError):assert_receipts(rows[:index]+rows[index+1:],arm)
 
+    def test_repeated_first_chunk_commit_cannot_prove_all_five_keys(self):
+        arm,rows=fixture()
+        commits=[r for r in rows if r['event']=='cf_publish_ready']
+        first=copy.deepcopy(commits[0])
+        for row in commits:
+            row['key']=copy.deepcopy(first['key'])
+            row['fill_id']=first['fill_id']
+        with self.assertRaisesRegex(AssertionError,'every distinct reserved content key'):
+            assert_receipts(rows,arm)
+
     def test_meaningful_scalar_negative_controls(self):
         arm,original=fixture()
         changes=[('http_only',lambda r:r.remove(selected(r,'cf_b_submitted','B'))),
@@ -174,6 +184,25 @@ class HookMechanicsTests(unittest.TestCase):
             self.assertTrue(observer.gate.is_set());self.assertFalse(observer.auto_release)
             self.assertEqual(selected(records,'cf_gate_release','B')['reason'],'b_submit_error')
             self.assertFalse(read_json(Path(tmp)/'concurrent-fill-error.json')['overlap_covered'])
+
+    def test_B_receipt_or_metadata_failure_cannot_strand_A_gate(self):
+        torch,cache,_=self.runtime()
+        from sglang.srt.spec_feature_cache import ExecutionIdentity
+        for cause in ('original-submit', 'metadata'):
+            with tempfile.TemporaryDirectory() as tmp:
+                arm,_=fixture();atomic_json(Path(tmp)/'arm.json',arm)
+                state,_=self.state(tmp,cache);observer=_Observer(state)
+                plan=SimpleNamespace(execution=ExecutionIdentity('epoch','rid-B','attempt-B',0),namespace='ns',tokens=tuple(range(1280)),
+                    N=1280,L=0,schema_signature='schema')
+                original=mock.Mock(side_effect=RuntimeError('actual submit failed'))
+                state.emit=mock.Mock(side_effect=OSError('receipt write failed'))
+                if cause=='metadata':
+                    plan.tokens=None
+                with self.subTest(cause=cause),self.assertRaisesRegex(OSError,'receipt write failed'):
+                    observer.submit(original,plan,SimpleNamespace())
+                self.assertTrue(observer.gate.is_set());self.assertFalse(observer.auto_release)
+                if cause=='original-submit':original.assert_called_once()
+                else:original.assert_not_called()
 
     def test_inactive_copy_wrapper_preserves_existing_semantics(self):
         import torch
