@@ -122,5 +122,40 @@ class CommandTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             RadixKey(array('q',tokens),extra_key='ns').match(RadixKey(tokens,extra_key='ns'))
 
+    def test_pressure_evicts_real_cache_without_observer_refresh_and_rejects_missing_fills(self):
+        import torch
+        from actual_faults.driver import apply_hs_pressure
+        from sglang.srt.spec_feature_cache import PrefixFeatureCache,FeatureSchema,FeatureSpec,ExecutionIdentity
+        schema=FeatureSchema((FeatureSpec('aux',2,'bfloat16',(1,)),FeatureSpec('last_hidden',2,'bfloat16',())))
+        row={'input_ids':list(range(1000,1008)),'loss_mask':[1]*8}
+        capacity=3*len(row['input_ids'])*schema.row_bytes
+        for defect in ('none','observer-refresh','missing-fills'):
+            cache=PrefixFeatureCache(schema,2,capacity)
+            def fill(tokens):
+                for key in cache.block_keys('ns',tuple(tokens)):
+                    owner=ExecutionIdentity('server','request','attempt',0)
+                    reservation=cache.reserve_fill(key,owner)
+                    if reservation:
+                        cache.publish_ready(reservation,{f.name:torch.zeros(2,f.width,dtype=torch.bfloat16) for f in schema.features})
+            fill(row['input_ids'])
+            observations=[]
+            def coverage():
+                lease=cache.lookup_and_pin('ns',tuple(row['input_ids']),len(row['input_ids']))
+                try:observations.append(lease.coverage_end);return [{'coverage':lease.coverage_end}]
+                finally:cache.release_lease(lease)
+            def fetch(value,pressure):
+                if defect=='observer-refresh':coverage()
+                if defect!='missing-fills':fill(pressure['input_ids'])
+            client=SimpleNamespace(submit=lambda *a,**k:(None,),fetch=fetch)
+            with self.subTest(defect=defect):
+                if defect=='none':
+                    receipt=apply_hs_pressure(client,'pressure',row,row,capacity=capacity,row_bytes=schema.row_bytes,coverage=coverage)
+                    self.assertEqual(observations,[8,0]);self.assertEqual(receipt['requests'],7)
+                    self.assertGreater(cache.stats()['evictions'],0)
+                else:
+                    with self.assertRaisesRegex(AssertionError,'did not evict'):
+                        apply_hs_pressure(client,'pressure',row,row,capacity=capacity,row_bytes=schema.row_bytes,coverage=coverage)
+                self.assertEqual(cache.stats()['active_leases'],0)
+
 
 if __name__=='__main__':unittest.main()
