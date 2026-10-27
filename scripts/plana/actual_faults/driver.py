@@ -24,9 +24,9 @@ FIXED = {
 }
 KINDS = ('match_error', 'admit_no_token', 'admit_no_membership', 'admit_after_append',
          'd2h_partial', 'publish_fail', 'publish_hold_cancel', 'publish_hold_timeout', 'd2h_cancel',
-         'prefill_retract', 'hs_only', 'kv_only', 'hs_shorter_than_kv', 'server_restart')
+         'prefill_retract', 'hs_only', 'kv_only', 'hs_shorter_than_kv', 'server_restart', 'same_content_fill_overlap')
 
-DEFAULT_KINDS = tuple(kind for kind in KINDS if kind not in ('kv_only','hs_shorter_than_kv','server_restart'))
+DEFAULT_KINDS = tuple(kind for kind in KINDS if kind not in ('kv_only','hs_shorter_than_kv','server_restart','same_content_fill_overlap'))
 
 
 def validate_config(config):
@@ -76,6 +76,9 @@ def validate_config(config):
         raise ValueError('unsupported fault kinds: ' + str(unknown))
     if 'server_restart' in config.get('kinds', DEFAULT_KINDS) and config.get('kinds') != ['server_restart']:
         raise ValueError('server_restart requires its own dedicated bounded run')
+    if 'same_content_fill_overlap' in config.get('kinds', DEFAULT_KINDS):
+        from actual_faults.concurrent_fill import validate_config as validate_fill
+        validate_fill(config)
     return config
 
 
@@ -143,6 +146,15 @@ def run(config, directory):
         wait_for(lambda:(directory/'driver-ready.json').exists(), 90, 'official driver script ready')
         client = Client(config, directory, server._base_url)
         atomic_json(directory/'arm.json', {})
+        if config.get('kinds') == ['same_content_fill_overlap']:
+            from actual_faults.concurrent_fill import run_case
+            result['cases'].append(run_case(client,directory,query))
+            result['source_unchanged']=manifest==source_manifest(config)
+            if not result['source_unchanged']:raise AssertionError('production/test source changed during concurrent-fill run')
+            atomic_json(directory/'driver-stop.json', {'stop':True})
+            script_future.result(timeout=client.timeout)
+            result['passed']=True
+            return result
         golden, _ = client.fetch(client.submit('golden-query',query,force_full=True)[0], query)
         replacement_golden, _ = client.fetch(client.submit('golden-replacement',replacement,force_full=True)[0], replacement)
         client.fetch(client.submit('warm-base',base,force_full=True)[0], base)

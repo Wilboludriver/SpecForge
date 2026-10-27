@@ -158,8 +158,8 @@ class RankState:
 
     def arm_for(self, req=None, request_id=None):
         arm = read_json(self.directory / 'arm.json', {})
-        if not arm:
-            return None
+        if not arm or arm.get('kind') == 'same_content_fill_overlap':
+            return None  # Dedicated two-actor observers are isolated from existing one-actor faults.
         if req is not None:
             if req.rid != arm['rid'] or (req.spec_capture or {}).get('sample_id') != arm['sample_id']:
                 return None
@@ -638,6 +638,8 @@ def install(directory):
         restorations.extend(install_bridge(state))
         restorations.extend(install_prefill_retract(state))
         restorations.extend(install_controller(state))
+        from actual_faults.concurrent_fill import install as install_concurrent_fill
+        restorations.extend(install_concurrent_fill(state))
         state.emit('source_manifest', sources={inspect.getsourcefile(type(bridge)): source_hash(inspect.getsourcefile(type(bridge)))})
     def put(sink, samples):
         for state in _STATES:
