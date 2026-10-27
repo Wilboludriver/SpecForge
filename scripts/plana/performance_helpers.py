@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from collections import Counter
 import hashlib
 import json
 import math
@@ -117,6 +118,54 @@ def build_workload(kind, native_rows, real_rows, *, warmup_steps, measured_steps
             'logical_footprint': footprint, 'data_sha256': canonical_digest(training)}
 
 
+def serialize_for_epoch_order(workload, epoch_indices, *, prompt_seed):
+    """Invert the actual producer shuffle so its chronological stream is fixed."""
+    if 'intended_training' in workload:
+        raise ValueError('workload epoch permutation was already serialized')
+    desired = copy.deepcopy(workload['training'])
+    order = list(epoch_indices(desired, 0, seed=prompt_seed))
+    if sorted(order) != list(range(len(desired))):
+        raise ValueError('actual producer order is not a complete permutation')
+    serialized = [None] * len(desired)
+    for index, row in zip(order, desired, strict=True):
+        serialized[index] = copy.deepcopy(row)
+    workload.update(training=serialized, intended_training=desired,
+                    prompt_seed=prompt_seed, producer_epoch_indices=order,
+                    data_sha256=canonical_digest(serialized),
+                    intended_data_sha256=canonical_digest(desired))
+
+
+def audit_consumed_order(consumed, fetches, workload):
+    """Verify real optimizer inputs, including warmup and duplicate originals."""
+    fingerprints = {}
+    for row in fetches:
+        sid, fingerprint = row['sample_id'], row['content_fingerprint']
+        if sid in fingerprints and fingerprints[sid] != fingerprint:
+            raise ValueError('a sample changed content across actual fetches')
+        fingerprints[sid] = fingerprint
+    selected = sorted((row for row in consumed if row['optimizer_stepped']), key=lambda row: row['step'])
+    expected = [content_fingerprint(row['input_ids'], row['loss_mask']) for row in workload['intended_training']]
+    if [row['step'] for row in selected] != list(range(1, len(expected)+1)):
+        raise ValueError('actual optimizer sequence is missing or duplicated')
+    actual, observed_steps = [], []
+    for row in selected:
+        if len(row['sample_ids']) != 1 or row['sample_ids'][0] not in fingerprints:
+            raise ValueError('actual optimizer input lacks exactly one validated full sample')
+        fingerprint = fingerprints[row['sample_ids'][0]]
+        actual.append(fingerprint)
+        observed_steps.append({'step': row['step'], 'sample_id': row['sample_ids'][0],
+                               'content_fingerprint': fingerprint})
+    warmup = workload['training_warmup_steps']
+    if Counter(actual[warmup:]) != Counter(expected[warmup:]):
+        raise ValueError('measured actual sample multiset differs from the intended workload')
+    if actual != expected:
+        raise ValueError('actual optimizer sample order differs from the intended workload')
+    return {'steps': observed_steps, 'ordered_fingerprints': actual, 'ordered_sha256': canonical_digest(actual),
+            'measured_fingerprints': actual[warmup:],
+            'measured_counter': dict(Counter(actual[warmup:])),
+            'measured_counter_matches': True, 'full_order_matches': True}
+
+
 def validate_rdma_proof(proof, *, expected_devices=None):
     required = ('protocol', 'gpu_put', 'cuda_source', 'cuda_register_status', 'put_status',
                 'fetch_equal', 'keys_removed', 'rdma_devices', 'forbidden_overrides', 'local_memcpy_setting')
@@ -149,6 +198,7 @@ def isolate_config(original, *, run_dir, workload, group, transport, cache_bytes
         raise ValueError('performance template must disable evaluation')
     cfg['tracking']['report_to'] = 'none'
     disagg = cfg['deployment']['disaggregated']
+    cfg.setdefault('runtime', {})['producer_concurrency'] = 1
     disagg['control_dir'], disagg['consumer_state_dir'] = str(root / 'control'), str(root / 'consumer-state')
     managed = disagg['managed_local']
     if len(managed['capture_servers']) != 1:
@@ -229,11 +279,15 @@ def rewrite_capture_argv(argv, script):
     raise ValueError('unsupported capture command: expected exact -m sglang.launch_server')
 
 
+def _resource_error(phase, exc, **context):
+    return {'phase': phase, 'error': f'{type(exc).__name__}: {exc}', **context}
+
+
 def read_process_sample(pid):
     base = Path('/proc') / str(pid)
     stat = (base / 'stat').read_text().rsplit(')', 1)[1].split()
     start_time = int(stat[19])
-    fields = {}
+    fields, errors, sources = {}, [], {}
     for name in ('status', 'smaps_rollup'):
         try:
             for line in (base / name).read_text().splitlines():
@@ -241,18 +295,22 @@ def read_process_sample(pid):
                 parts = value.split()
                 if parts and parts[0].isdigit():
                     fields[key] = int(parts[0]) * (1024 if len(parts) > 1 and parts[1] == 'kB' else 1)
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            pass
+            sources[name] = True
+        except (OSError, ProcessLookupError) as exc:
+            sources[name] = False
+            errors.append(_resource_error(name, exc, pid=pid))
     return {'pid': pid, 'start_time': start_time, 'rss_bytes': fields.get('VmRSS'),
-            'pss_bytes': fields.get('Pss'), 'locked_bytes': fields.get('VmLck'), 'hwm_bytes': fields.get('VmHWM')}
+            'pss_bytes': fields.get('Pss'), 'locked_bytes': fields.get('VmLck'), 'hwm_bytes': fields.get('VmHWM'),
+            'sources': sources, 'read_errors': errors}
 
 
 class ProcessSampler:
-    """Sample only spawned owned process trees; physical peaks are observed bounds."""
+    """Sample owned trees, with explicit unavailable values and failure coverage."""
     def __init__(self, output, interval=.1):
         self.output, self.interval = Path(output), interval
         self.roots, self.identities = {}, {}
         self.lock, self.stop_event = threading.Lock(), threading.Event()
+        self.fatal_errors, self.sample_count = [], 0
         self.thread = threading.Thread(target=self._run, name='plana-owned-resource-sampler', daemon=True)
 
     def add(self, label, process):
@@ -267,8 +325,11 @@ class ProcessSampler:
         self.thread.join(5)
         if self.thread.is_alive():
             raise RuntimeError('owned resource sampler did not drain')
+        if self.fatal_errors:
+            raise RuntimeError('owned resource sampler failed: ' + json.dumps(self.fatal_errors))
+        return {'samples': self.sample_count, 'fatal_errors': [], 'thread_drained': True}
 
-    def _owned(self):
+    def _owned(self, errors):
         with self.lock:
             roots = sorted(self.roots.items(), key=lambda item:item[0]==os.getpid())
         found = {}
@@ -283,36 +344,64 @@ class ProcessSampler:
                 found[current] = label
                 try:
                     pending.extend(int(value) for value in Path(f'/proc/{current}/task/{current}/children').read_text().split())
-                except (FileNotFoundError, PermissionError, ProcessLookupError):
-                    pass
+                except (OSError, ProcessLookupError) as exc:
+                    errors.append(_resource_error('children', exc, pid=current))
         return found
 
-    def _run(self):
-        while not self.stop_event.is_set():
-            owned = self._owned()
-            records = []
-            for pid, label in owned.items():
-                try:
-                    row = read_process_sample(pid)
-                    previous = self.identities.setdefault(pid, row['start_time'])
-                    if previous != row['start_time']:
-                        continue
-                    records.append(dict(row, label=label))
-                except (FileNotFoundError, ProcessLookupError):
-                    pass
-            gpu = []
+    def _sample_once(self):
+        errors = []
+        owned = self._owned(errors)
+        tree_complete = not errors
+        records = []
+        for pid, label in owned.items():
             try:
-                result = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,used_gpu_memory,gpu_uuid',
-                                         '--format=csv,noheader,nounits'], text=True, capture_output=True, timeout=2)
-                if result.returncode == 0:
-                    for line in result.stdout.splitlines():
-                        parts = [part.strip() for part in line.split(',')]
-                        if len(parts) == 3 and parts[0].isdigit() and int(parts[0]) in owned and parts[1].isdigit():
+                row = read_process_sample(pid)
+                previous = self.identities.setdefault(pid, row['start_time'])
+                if previous != row['start_time']:
+                    errors.append({'phase': 'identity', 'pid': pid, 'error': 'PID start time changed'})
+                    continue
+                records.append(dict(row, label=label))
+                errors.extend(row.get('read_errors', []))
+            except (OSError, ProcessLookupError) as exc:
+                errors.append(_resource_error('host', exc, pid=pid))
+        gpu, gpu_query_complete = [], False
+        try:
+            result = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,used_gpu_memory,gpu_uuid',
+                                     '--format=csv,noheader,nounits'], text=True, capture_output=True, timeout=2)
+            if result.returncode == 0:
+                gpu_query_complete = True
+                for line in result.stdout.splitlines():
+                    parts = [part.strip() for part in line.split(',')]
+                    if len(parts) == 3 and parts[0].isdigit() and int(parts[0]) in owned:
+                        if parts[1].isdigit():
                             gpu.append({'pid': int(parts[0]), 'physical_used_bytes': int(parts[1]) << 20, 'gpu_uuid': parts[2]})
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-            append_json(self.output, {'time': time.time(), 'monotonic': time.perf_counter(), 'host': records, 'gpu': gpu, 'sample_interval_s': self.interval})
-            self.stop_event.wait(self.interval)
+                        else:
+                            gpu_query_complete = False
+                            errors.append({'phase': 'gpu', 'pid': int(parts[0]), 'error': 'physical used GPU memory unavailable'})
+            else:
+                errors.append({'phase': 'gpu', 'error': f'nvidia-smi exit {result.returncode}'})
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(_resource_error('gpu', exc))
+        append_json(self.output, {'time': time.time(), 'monotonic': time.perf_counter(), 'host': records, 'gpu': gpu,
+            'owned_process_count': len(owned), 'owned_tree_complete': tree_complete,
+            'gpu_query_complete': gpu_query_complete, 'errors': errors, 'sample_interval_s': self.interval})
+        self.sample_count += 1
+
+    def _run(self):
+        try:
+            while not self.stop_event.is_set():
+                self._sample_once()
+                self.stop_event.wait(self.interval)
+        except Exception as exc:
+            failure = _resource_error('sampler_thread', exc)
+            self.fatal_errors.append(failure)
+            try:
+                append_json(self.output, {'time': time.time(), 'monotonic': time.perf_counter(),
+                    'host': [], 'gpu': [], 'owned_tree_complete': False, 'gpu_query_complete': False,
+                    'errors': [failure], 'fatal_sampler_error': True, 'sample_interval_s': self.interval})
+            except Exception:
+                pass  # stop() still exposes the original failure if the output itself is unavailable.
+            self.stop_event.set()
 
 
 def comparison_contract(config, workload_sha, schema, cache_bytes, chunk_tokens):
@@ -346,6 +435,7 @@ def compare_runs(run_dirs):
     rows = []
     contracts = set()
     initial = set()
+    consumed = set()
     for directory in run_dirs:
         directory = Path(directory)
         manifest = json.loads((directory / 'manifest.json').read_text())
@@ -356,10 +446,14 @@ def compare_runs(run_dirs):
             if len(states) != 1:
                 raise ValueError('one initial actual draft fingerprint required')
             initial.add(states[0]['sha256'])
+            audit = result['consumed_order']
+            if not audit['full_order_matches'] or not audit['measured_counter_matches']:
+                raise ValueError('actual optimizer input audit did not pass')
+            consumed.add(audit['ordered_sha256'])
         rows.append({'group': result['group'], 'status': result['status'], 'run_dir': str(directory),
                      'optimizer_step_wall_s': result.get('training', {}).get('optimizer_step_wall_s')})
-    if len(contracts) != 1 or len(initial) > 1:
-        raise ValueError('workload/configuration/initial draft differs across comparison groups')
+    if len(contracts) != 1 or len(initial) > 1 or len(consumed) > 1:
+        raise ValueError('workload/configuration/initial draft/actual sample order differs across comparison groups')
     passing = {row['group']: row for row in rows if row['status'] == 'passed'}
     if 'host-on' not in passing or 'host-off' not in passing:
         raise ValueError('passing official host-off and candidate host-on required')
