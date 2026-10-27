@@ -3,18 +3,61 @@ import copy
 import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts/plana'
 sys.path.insert(0, str(SCRIPTS))
 from performance_helpers import (POLL_DEFAULTS, POLL_SOURCES, audit_polling_receipts, comparison_contract,
-    polling_policy_call, validate_polling_policy)
+    content_fingerprint, polling_policy_call, validate_polling_policy)
 
 
 POLICY = dict(zip(POLL_DEFAULTS, (0.003, 0.007, 0.011)))
 
 
 class PolicyTests(unittest.TestCase):
+    def test_complete_summary_uses_actual_git_identity_manifest_schema(self):
+        import run_performance as runner
+        project = next(p for p in SCRIPTS.parents if (p/'NEXT_SESSION_PROMPT.txt').exists())
+        source = project/'src/SpecForge-official'
+        identity = runner.git_identity(source, runner.OFFICIAL_SF)
+        self.assertIn('path', identity)
+        self.assertNotIn('root', identity)
+        row = {'input_ids': [1, 2], 'loss_mask': [1, 1]}
+        workload = {'intended_training': [row, row], 'training_warmup_steps': 1,
+                    'measured_steps': 1, 'kind': 'hot'}
+        polling = [{'field': k, 'value': v, 'mode': 'official-api', 'applied': True,
+                    'explicit_from_caller': False, 'source_file': str(source/POLL_SOURCES[k][0]),
+                    'callable': POLL_SOURCES[k][1], 'monotonic': 0.} for k, v in POLICY.items()]
+        events = {
+            'polling-policy': polling,
+            'consumed': [{'step': i, 'sample_ids': [f's{i}'], 'optimizer_stepped': True,
+                          'monotonic': float(i)} for i in (1, 2)],
+            'fetch-validation': [{'sample_id': f's{i}', 'content_fingerprint': content_fingerprint(row['input_ids'], row['loss_mask']),
+                'validation_wall_s': .001, 'monotonic': float(i)} for i in (1, 2)],
+            'training-steps': [{'step': i, 'metrics': {'perf/optimizer_step_time_s': .1},
+                                'monotonic': float(i)} for i in (1, 2)],
+            'captures': [{'sample_id': f's{i}', 'attempt_id': f'a{i}', 'N': 2, 'L': 0,
+                          'span': [0, 2], 'monotonic': float(i)} for i in (1, 2)],
+            'fit': [{'measured_fit_boundary_wall_s': .1, 'monotonic': 3.}],
+            'draft-initial': [{'sha256': 'synthetic-cpu-fixture', 'monotonic': 0.}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); (root/'events').mkdir()
+            (root/'manifest.json').write_text(json.dumps({'specforge': identity,
+                'polling_policy': POLICY, 'polling_mode': 'official-api'}))
+            for kind, records in events.items():
+                (root/'events'/f'{kind}-1.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+            result = runner.summarize(root, workload, 'host-off')
+            self.assertTrue(result['polling']['all_components_verified'])
+            self.assertTrue(result['consumed_order']['full_order_matches'])
+            self.assertEqual(result['capture']['computed_tokens'], 2)
+            self.assertEqual(result['training']['optimizer_step_wall_s'], .1)
+            polling[0]['source_file'] = '/tmp/foreign-source.py'
+            (root/'events'/'polling-policy-1.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in polling))
+            with self.assertRaisesRegex(AssertionError, 'source differs'):
+                runner.summarize(root, workload, 'host-off')
+
     def test_nonfinite_zero_negative_boolean_and_missing_fields_fail(self):
         self.assertEqual(validate_polling_policy(POLICY), POLICY)
         for field in POLICY:
