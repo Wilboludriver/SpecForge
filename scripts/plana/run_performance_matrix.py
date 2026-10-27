@@ -6,6 +6,7 @@ sample validation and measurement remain in the unchanged integrated harness.
 """
 from __future__ import annotations
 import argparse
+from contextlib import ExitStack
 import ctypes
 import fcntl
 import hashlib
@@ -343,15 +344,17 @@ def run_child(argv,env,log_path,*,timeout_s,grace_s,checkpoint):
 
 def port_snapshot(ports):
     busy=[]
-    for port in ports:
-        with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as probe:
-            probe.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    # Match official managed_preflight's strict raw bind, including TIME_WAIT
+    # and bound-but-not-listening sockets. Hold all probes until the full check.
+    with ExitStack() as probes:
+        for port in ports:
+            probe=probes.enter_context(socket.socket(socket.AF_INET,socket.SOCK_STREAM))
             try:probe.bind(('0.0.0.0',port))
             except OSError as exc:busy.append({'port':port,'error':str(exc)})
-    for source in ('/proc/net/tcp','/proc/net/tcp6'):
-        for line in Path(source).read_text().splitlines()[1:]:
-            fields=line.split();port=int(fields[1].split(':')[1],16)
-            if fields[3]=='0A' and port in ports and not any(row['port']==port for row in busy):busy.append({'port':port,'error':'LISTEN in '+source})
+        for source in ('/proc/net/tcp','/proc/net/tcp6'):
+            for line in Path(source).read_text().splitlines()[1:]:
+                fields=line.split();port=int(fields[1].split(':')[1],16)
+                if fields[3]=='0A' and port in ports and not any(row['port']==port for row in busy):busy.append({'port':port,'error':'LISTEN in '+source})
     return busy
 
 
