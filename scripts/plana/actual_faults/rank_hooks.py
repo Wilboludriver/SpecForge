@@ -5,7 +5,6 @@ request broadcast / bridge admission sequence. No tensor data is fabricated.
 """
 from __future__ import annotations
 from contextlib import ExitStack, contextmanager
-from dataclasses import replace
 import inspect
 import os
 from pathlib import Path
@@ -139,6 +138,7 @@ class RankState:
         self._event_lock = threading.Lock()
         self.gates = {}
         self.delay_events = {}
+        self.cuda_gates = {}
         self.request_arms = {}
         self.last_command = None
         self.bridge = bridge if bridge is not None else scheduler.spec_feature_bridge
@@ -153,7 +153,8 @@ class RankState:
         with self._event_lock:
             self.sequence += 1
             append_json(self.path, {'seq': self.sequence, 'rank': self.rank,
-                                   'pid': os.getpid(), 'event': event, **values})
+                                   'pid': os.getpid(), 'monotonic_ns': time.monotonic_ns(),
+                                   'event': event, **values})
 
     def arm_for(self, req=None, request_id=None):
         arm = read_json(self.directory / 'arm.json', {})
@@ -215,6 +216,9 @@ class RankState:
             if delayed is not None:
                 if not delayed['event'].query() or any(ref() is not None for ref in delayed['sources']):
                     raise AssertionError('actual delayed CUDA event/source ownership not drained')
+                if delayed.get('gate') is not None:
+                    delayed['gate'].close_after_drain()
+                    self.cuda_gates.pop(command['case_id'])
         elif action != 'snapshot':
             raise ValueError('unsupported test command: ' + action)
         coverage = None
@@ -495,14 +499,32 @@ def install_bridge(state):
         setattr(bridge, name, collective)
     original_control = bridge.control
     def control(body):
+        release_gate = None
         if body.get('action') == 'resolve' and body.get('cancel'):
             arm = read_json(state.directory / 'arm.json', {})
             entry = state.delay_events.get(arm.get('case_id'))
             if entry is not None and body.get('sample_id') == arm.get('sample_id'):
                 if not entry.get('cancel_observed'):
                     entry['cancel_observed'] = True
-                    state.emit('cancel_event_observation', case_id=arm['case_id'], event_pending=not entry['event'].query())
-        return original_control(body)
+                    pending = not entry['event'].query()
+                    state.emit('cancel_event_observation', case_id=arm['case_id'], event_pending=pending,
+                               event_handle=int(entry['event'].cuda_event))
+                    if entry.get('gate') is not None:
+                        release_gate = entry['gate']
+        try:
+            result = original_control(body)
+        except BaseException:
+            if release_gate is not None:
+                release_gate.release('control_error')
+            raise
+        else:
+            # Invalidate the execution while the DMA is genuinely pending;
+            # only then allow the real controller-owned stream to drain.
+            if release_gate is not None:
+                state.emit('cancel_control_applied',case_id=arm['case_id'],
+                           state=result.get('state'),writer_drained=result.get('writer_drained'))
+                release_gate.release('observed_cancel')
+            return result
     bridge.control = control
     originals.append((bridge, 'control', original_control))
     # Collectives restored on worker exit via the global installation closure.
@@ -526,26 +548,6 @@ def install_controller(state):
     controller = state.bridge.controller
     if controller is None:
         return []
-    original_submit = controller.submit
-    def submit(plan, span):
-        arm = state.request_arms.get(plan.execution.request_id)
-        if state.fire(arm, 'd2h_cancel'):
-            import torch
-            source = next(iter(span.features.values()))
-            if not source.is_cuda:
-                raise AssertionError('actual D2H fixture requires CUDA snapshots')
-            stream = torch.cuda.Stream(device=source.device)
-            with torch.cuda.stream(stream):
-                stream.wait_event(span.ready_event)
-                torch.cuda._sleep(int(arm.get('delay_cycles', 2_000_000_000)))
-                event = torch.cuda.Event()
-                event.record(stream)
-            state.delay_events[arm['case_id']] = {'event': event, 'stream': stream,
-                                                  'sources': [weakref.ref(t) for t in span.features.values()]}
-            span = replace(span, ready_event=event)
-            state.emit('delayed_real_cuda_event', case_id=arm['case_id'], event_pending=not event.query())
-            atomic_json(state.directory / f'event-{arm["case_id"]}.json', {'pending': not event.query()})
-        return original_submit(plan, span)
     original_copy = controller._copy_suffix
     def copy(job):
         previous = getattr(_LOCAL, 'copy', None)
@@ -555,8 +557,8 @@ def install_controller(state):
             return original_copy(job)
         finally:
             _LOCAL.copy = previous
-    controller.submit, controller._copy_suffix = submit, copy
-    return [(controller, 'submit', original_submit), (controller, '_copy_suffix', original_copy)]
+    controller._copy_suffix = copy
+    return [(controller, '_copy_suffix', original_copy)]
 
 
 def guarded_copy(original, target, source, *args, **kwargs):
@@ -573,6 +575,16 @@ def guarded_copy(original, target, source, *args, **kwargs):
     if name == 'aux' and arm is not None and arm['kind'] == 'd2h_partial' and state.rank in arm['ranks'] and not context['issued']:
         import torch
         torch.cuda._sleep(int(arm.get('delay_cycles', 2_000_000_000)))
+    if name == 'aux' and arm is not None and arm['kind'] == 'd2h_cancel' and state.rank in arm['ranks'] and not context['issued']:
+        import torch
+        from actual_faults.cuda_gate import CudaCopyGate
+        context['cancel_gate'] = CudaCopyGate(source.device, torch.cuda.current_stream(source.device),
+            timeout_s=float(arm.get('gate_timeout_s',45)),
+            emit=lambda event, **values: state.emit(event, case_id=arm['case_id'], **values))
+        # Keep flag/stream ownership even if the following real copy raises.
+        # Unknown drains remain retained until the owned test process exits.
+        state.cuda_gates[arm['case_id']] = context['cancel_gate']
+        context['cancel_gate'].arm()
     if name == 'last_hidden' and state.fire(arm, 'd2h_partial'):
         if not context['issued']:
             raise AssertionError('partial-copy fixture did not submit any actual CUDA D2H before failure')
@@ -588,6 +600,25 @@ def guarded_copy(original, target, source, *args, **kwargs):
         raise RuntimeError('test injected second-feature D2H failure after real first DMA')
     value = original(target, source, *args, **kwargs)
     context['issued'].append(name)
+    if name == 'aux' and state.fire(arm, 'd2h_cancel'):
+        # Observe the actual first DMA on the controller-owned copy stream.
+        # Delaying the producer snapshot event can expire before the scheduler
+        # returns from forward completion and reaches HTTP control dispatch.
+        import torch
+        stream = torch.cuda.current_stream(source.device)
+        event = torch.cuda.Event()
+        event.record(stream)
+        pending = not event.query()
+        state.delay_events[arm['case_id']] = {'event': event, 'stream': stream,
+            'sources': [weakref.ref(t) for t in context['job'].features.values()],
+            'gate': context['cancel_gate']}
+        state.emit('delayed_real_cuda_event', case_id=arm['case_id'], event_pending=pending,
+                   stage='after_real_aux_d2h', issued=list(context['issued']),
+                   event_handle=int(event.cuda_event), producer_event_handle=int(context['job'].ready_event.cuda_event),
+                   source_pointers={key:value.data_ptr() for key,value in context['job'].features.items()})
+        atomic_json(state.directory / f'event-{arm["case_id"]}.json',
+                    {'pending': pending, 'stage': 'after_real_aux_d2h', 'issued': list(context['issued']),
+                     'event_handle': int(event.cuda_event), 'monotonic_ns': time.monotonic_ns()})
     return value
 
 

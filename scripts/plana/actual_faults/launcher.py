@@ -81,7 +81,7 @@ def drive(ctx, directory):
             state.command()
             yield
         state.emit('driver_stop', fully_idle=ctx.is_fully_idle)
-        if not ctx.is_fully_idle or state.bridge.jobs or state.fixture_pins:
+        if not ctx.is_fully_idle or state.bridge.jobs or state.fixture_pins or state.cuda_gates:
             raise AssertionError('driver stopped while engine/capture work remains')
     finally:
         for gate in state.gates.values():

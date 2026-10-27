@@ -124,7 +124,8 @@ def require_fault_outcome(client, future, row, reference, *, may_retry):
 
 def run(config, directory):
     from actual_faults.launcher import start, drive, execute
-    from actual_faults.scenarios import Client, arm, command, rank_events, assert_fault_receipts, assert_prefill_retract_receipts
+    from actual_faults.scenarios import (Client, arm, command, rank_events, assert_fault_receipts,
+                                        assert_prefill_retract_receipts, assert_cuda_cancel_receipts)
     from specforge.inference.capture_protocol import CaptureProtocol
     from specforge.inference.adapters.server_capture import _SessionPost
     directory = Path(directory)
@@ -234,6 +235,8 @@ def run(config, directory):
                     if kind.startswith('publish_hold_') or kind=='d2h_cancel':
                         marker = directory / (f'event-{case_id}.json' if kind=='d2h_cancel' else f'gate-{case_id}.json')
                         wait_for(marker.exists, timeout, 'actual held transfer/publication boundary')
+                        if kind=='d2h_cancel' and not read_json(marker)['pending']:
+                            raise AssertionError('real DMA gate was not pending before cancellation')
                         with client.store._lock:
                             fence = client.store._capture_fences[sample_id]
                         if kind=='publish_hold_timeout':
@@ -262,9 +265,8 @@ def run(config, directory):
                             command(directory,'release_gate',tp_size=tp,timeout=timeout,case_id=case_id)
                         case.update(require_fault_outcome(client,future,query,golden,may_retry=False))
                         if kind=='d2h_cancel':
-                            observations=[row for row in rank_events(directory,case_id) if row['event']=='cancel_event_observation']
-                            if not observations or not observations[0]['event_pending']:
-                                raise AssertionError('actual CUDA event was not observed pending at cancellation')
+                            case['pending_dma_proof']=assert_cuda_cancel_receipts(
+                                rank_events(directory,case_id),case_id,read_json(marker))
                     else:
                         if kind=='d2h_partial':
                             marker=directory/f'partial-{case_id}.json'
