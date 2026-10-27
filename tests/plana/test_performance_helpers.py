@@ -92,6 +92,28 @@ class AccountingTests(unittest.TestCase):
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_run_and_store_namespaces_include_model_workload_repetition_and_retry(self):
+        original=config()
+        original['deployment']['disaggregated']['store_id']='stale-template-store'
+        paths=['/tmp/matrix-r1/q3/cold/r1/rdma-host-off',
+               '/tmp/matrix-r1/q35/cold/r1/rdma-host-off',
+               '/tmp/matrix-r1/q3/hot/r1/rdma-host-off',
+               '/tmp/matrix-r1/q3/cold/r2/rdma-host-off',
+               '/tmp/matrix-r2/q3/cold/r1/rdma-host-off',
+               '/tmp/matrix-r1/q3/cold/r1/rdma-host-on']
+        configs=[helpers.isolate_config(original,run_dir=path,workload={'training':[row()]*72},
+            group='host-on' if path.endswith('host-on') else 'host-off',transport='rdma',
+            cache_bytes=64<<20,chunk_tokens=256,rdma_devices='mlx5_2') for path in paths]
+        ids=[cfg['run_id'] for cfg in configs]
+        self.assertEqual(len(set(ids)),len(paths))
+        self.assertEqual(len({cfg['deployment']['disaggregated']['store_id'] for cfg in configs}),len(paths))
+        self.assertTrue(all(cfg['run_id']==cfg['deployment']['disaggregated']['store_id'] for cfg in configs))
+        contracts=[helpers.comparison_contract(cfg,'same-data',{},64<<20,256) for cfg in configs]
+        self.assertTrue(all(contract==contracts[0] for contract in contracts))
+        self.assertEqual(original['deployment']['disaggregated']['store_id'],'stale-template-store')
+        self.assertEqual(helpers.performance_run_id(paths[0]),helpers.performance_run_id(Path(paths[0])/'.'))
+        self.assertNotEqual(ids[0],'rdma-host-off')
+
     def test_tcp_never_qualifies_as_device(self):
         with self.assertRaises(ValueError):helpers.isolate_config(config(),run_dir='/tmp/run',
             workload={'training':[row()]*72},group='device-off',transport='tcp',cache_bytes=64<<20,chunk_tokens=256,rdma_devices='mlx5_0')
