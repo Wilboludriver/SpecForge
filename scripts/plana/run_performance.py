@@ -696,7 +696,7 @@ def summarize(run_dir, workload, group):
     if len(fits)!=1:raise AssertionError('exactly one actual training rank fit record required')
     manifest=json.loads((Path(run_dir)/'manifest.json').read_text())
     polling=audit_polling_receipts(_load_events(run_dir,'polling-policy'),manifest['polling_policy'],manifest['polling_mode'],
-                                 source_root=manifest['specforge']['root'])
+                                 source_root=manifest['specforge']['path'])
     result={'polling':polling,'consumed_order':consumed_order,'training':aggregate_training(steps,warmup_steps=warmup,measured_steps=workload['measured_steps']),
             'capture':aggregate_capture(captures),'actual_fit':fits[0],
             'initial_draft':_load_events(run_dir,'draft-initial'),
