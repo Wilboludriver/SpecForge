@@ -22,12 +22,13 @@ except ModuleNotFoundError as exc:
 
 
 class ByteBackend:
-    def __init__(self):self.data={};self.remove_calls=[];self.fail_remove=False
+    def __init__(self):self.data={};self.remove_calls=[];self.get_calls=[];self.fail_remove=False
     def register_buffer(self,ptr,size):return 0
     def unregister_buffer(self,ptr):return 0
     def is_exist(self,key):return int(key in self.data)
     def put_from(self,key,ptr,size,config=None):self.data[key]=ctypes.string_at(ptr,size);return 0
     def get_into(self,key,ptr,size):
+        self.get_calls.append(key)
         if key not in self.data:return -1
         data=self.data[key];ctypes.memmove(ptr,data,min(size,len(data)));return min(size,len(data))
     def remove(self,key,**kw):
@@ -144,6 +145,34 @@ class CrossStoreCleanup(unittest.TestCase):
         self.assertEqual(len(self.bridge.registry.active),0)
         self.assertEqual(store.health()['provisional_external'],0)
         self.begin('replacement-after-recovered-begin')
+
+    def test_fresh_consumer_stale_oldref_rejected_before_fetching_replacement(self):
+        old,ref,producer,consumer=self.new_old_pair()
+        _,handle=consumer.get(ref);consumer.release(handle)
+        replacement=self.begin('attempt-b');self.published(replacement,17.)
+        fresh=MooncakeFeatureStore(store=self.backend,store_id='shared-store');self.stores.append(fresh)
+        # Supply only the real control transport seam; the fresh store has no
+        # local released tombstone and must validate oldref at the server.
+        fresh.track_capture_fence(old,['hidden_states'],control_fn=self.control)
+        calls=len(self.backend.get_calls)
+        with self.assertRaises(Exception):fresh.get(ref)
+        self.assertEqual(len(self.backend.get_calls),calls,'stale oldref reached physical read of new g1 bytes')
+        self.assert_replacement(17.)
+
+    def test_active_remote_read_handle_blocks_cleanup_until_release(self):
+        old,ref,producer,consumer=self.new_old_pair()
+        tensors,handle=consumer.get(ref)
+        self.assertTrue(torch.equal(tensors['hidden_states'],torch.ones(1,4,2)))
+        calls=len(self.backend.remove_calls)
+        try:producer.abort(ref.sample_id,attempt_token=old['reservation_token'])
+        except Exception:pass
+        self.assertEqual(len(self.backend.remove_calls),calls,'cleanup removed keys held by another process read handle')
+        self.assert_replacement(1.)
+        with self.assertRaises(ValueError):self.begin('attempt-b')
+        consumer.release(handle)
+        replacement=self.begin('attempt-b');self.published(replacement,19.)
+        producer.drain_pending_removals(max_attempts=2,retry_interval_s=0)
+        self.assert_replacement(19.)
 
     def test_unknown_old_server_state_fails_closed_before_delete(self):
         old,ref,producer,consumer=self.new_old_pair()
