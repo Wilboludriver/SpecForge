@@ -222,9 +222,11 @@ def run(config, directory):
                             client.fetch(client.submit(case_id+'-long-warm',query,force_full=True)[0],query,reference=golden)
                         finally:
                             command(directory,'release_hs',tp_size=tp,timeout=timeout,pin_id=pin_id)
+                        case['ordinary_kv_probes']=client.warm_ordinary_checkpoint(query,case_id)
                     else:
                         client.fetch(client.submit(case_id+'-kv-warm-base',base,force_full=True)[0],base)
-                        command(directory,'pin_kv',tp_size=tp,timeout=timeout,tokens=query['input_ids'],pin_id=pin_id)
+                        case['ordinary_kv_probes']=client.warm_ordinary_checkpoint(query,case_id)
+                        case['kv_pin_receipts']=command(directory,'pin_kv',tp_size=tp,timeout=timeout,tokens=query['input_ids'],pin_id=pin_id)
                         try:
                             import math
                             needed=math.ceil(capacity/(len(base['input_ids'])*row_bytes))+4
@@ -334,6 +336,10 @@ def run(config, directory):
             try:
                 if current:command(directory,'release_gate',tp_size=client.tp_size,timeout=5,case_id=current['case_id'])
             except BaseException as exc:result['barrier_release_error']=repr(exc)
+        if server is not None and client is not None and script_future is not None and not script_future.done():
+            try:command(directory,'release_fixture_pins',tp_size=client.tp_size,timeout=5)
+            except BaseException as exc:
+                result['fixture_release_error']=repr(exc);result['passed']=False
         if client is not None:
             try:
                 client.cleanup()
@@ -348,7 +354,7 @@ def run(config, directory):
             try:client.close()
             except BaseException as exc:result['close_error']=repr(exc);result['passed']=False
         atomic_json(directory/'driver-stop.json', {'stop':True})
-        if script_future is not None and not script_future.done():
+        if script_future is not None:
             try:script_future.result(timeout=10)
             except TimeoutError:
                 # Touch only the Process object created by this launcher. The
@@ -356,7 +362,10 @@ def run(config, directory):
                 server._terminate_process(server._server_process)
                 try:script_future.result(timeout=5)
                 except BaseException as exc:result['script_stop_error']=repr(exc);result['passed']=False
-            except BaseException as exc:result['script_stop_error']=repr(exc);result['passed']=False
+            except BaseException as exc:
+                import traceback
+                result['script_stop_error']=repr(exc);result['passed']=False
+                (directory/'script-failure.txt').write_text(traceback.format_exc())
         if server is not None:
             try:server.shutdown()
             except BaseException as exc:result['shutdown_error']=repr(exc);result['passed']=False

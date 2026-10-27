@@ -182,8 +182,24 @@ class RankState:
         if not command or command['id'] == self.last_command:
             return
         self.last_command = command['id']
+        try:
+            self._apply_command(command)
+        except Exception as exc:
+            # A fixture error must not kill the scripted owner and strand peer
+            # collectives/HTTP cleanup. Return an explicit failed rank receipt.
+            import traceback
+            atomic_json(self.directory / f'ack-{command["id"]}-rank{self.rank}.json',
+                        {'rank':self.rank,'action':command['action'],
+                         'error':repr(exc),'traceback':traceback.format_exc()})
+            self.emit('command_failed',command_id=command['id'],action=command['action'],error=repr(exc))
+
+    def _apply_command(self, command):
         action = command['action']
-        if action == 'release_gate':
+        probe = None
+        if action == 'release_fixture_pins':
+            for key in tuple(self.fixture_pins):
+                self._release_fixture_pin(key)
+        elif action == 'release_gate':
             gate = self.gates.get(command['case_id'])
             if gate is not None:
                 gate.set()
@@ -194,23 +210,27 @@ class RankState:
                 if key in self.fixture_pins:
                     raise AssertionError('duplicate live fixture pin identifier')
                 result = self.probe_kv(tokens)
+                probe = {'L':len(result.device_indices),'N':len(tokens),
+                         'namespace':self.bridge.namespace,
+                         **{name:getattr(result,name,None) for name in
+                            ('full_kv_hit_length','mamba_branching_seqlen','last_device_node','best_match_node')}}
+                self.emit('fixture_kv_probe',command_id=command['id'],pin_id=key,**probe)
                 if not len(result.device_indices):
                     raise AssertionError('KV pin fixture has no actual reusable checkpoint')
                 receipt = self.scheduler.tree_cache.inc_lock_ref(result.last_device_node)
-                self.fixture_pins[key] = ('kv', result.last_device_node, receipt.to_dec_params())
+                self.fixture_pins[key] = ('kv', result.last_device_node, receipt)
             elif action == 'release_kv':
-                _, node, receipt = self.fixture_pins.pop(key)
-                self.scheduler.tree_cache.dec_lock_ref(node, receipt)
+                self._release_fixture_pin(key)
             elif self.bridge.writer:
                 if action == 'pin_hs':
                     if key in self.fixture_pins:
                         raise AssertionError('duplicate live fixture pin identifier')
                     lease = self.bridge.cache.lookup_and_pin(self.bridge.namespace, tokens, len(tokens))
+                    self.fixture_pins[key] = ('hs', lease)
                     if not lease.coverage_end:
                         raise AssertionError('HS pin fixture has no actual READY coverage')
-                    self.fixture_pins[key] = ('hs', lease)
                 elif action == 'release_hs':
-                    self.bridge.cache.release_lease(self.fixture_pins.pop(key)[1])
+                    self._release_fixture_pin(key)
         elif action == 'retire_delay':
             delayed = self.delay_events.pop(command['case_id'], None)
             if delayed is not None:
@@ -227,8 +247,21 @@ class RankState:
             coverage = lease.coverage_end
             self.bridge.cache.release_lease(lease)
         atomic_json(self.directory / f'ack-{command["id"]}-rank{self.rank}.json',
-                    {'rank': self.rank, 'action': action, 'coverage': coverage,
+                    {'rank': self.rank, 'action': action, 'coverage': coverage, 'kv_probe':probe,
                      'engine': engine_snapshot(self.scheduler)})
+
+    def _release_fixture_pin(self, key):
+        owned = self.fixture_pins[key]
+        if owned[0] == 'kv':
+            _, node, receipt = owned
+            params = receipt.to_dec_params() if hasattr(receipt,'to_dec_params') else receipt
+            self.scheduler.tree_cache.dec_lock_ref(node, params)
+        elif owned[0] == 'hs':
+            self.bridge.cache.release_lease(owned[1])
+        else:
+            raise AssertionError('unknown fixture pin owner kind')
+        # Do not discard the ownership record if its actual release raises.
+        del self.fixture_pins[key]
 
     def probe_kv(self, tokens):
         from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
