@@ -125,6 +125,29 @@ def require_fault_outcome(client, future, row, reference, *, may_retry):
     return {'outcome':'safe_retry_complete_sample', 'diagnostics':value.metadata.get('capture_diagnostics')}
 
 
+def apply_hs_pressure(client, case_id, query, base, *, capacity, row_bytes, coverage):
+    """Evict through real fills without keeping the victim hot by observing it."""
+    import math
+    needed = math.ceil(capacity / (len(base['input_ids']) * row_bytes)) + 4
+    first_tokens = [token for token in range(18, 145)
+                    if token != query['input_ids'][0]]
+    if needed > len(first_tokens):
+        raise ValueError('pressure working set exceeds the bounded distinct-token fixture')
+    before = coverage()
+    if before[0]['coverage'] <= 0:
+        raise AssertionError('pressure victim lacks initial real HS coverage')
+    # lookup_and_pin is an LRU access. Query only outside the pressure interval.
+    for index, token in enumerate(first_tokens[:needed]):
+        pressure = {name:list(base[name]) for name in ('input_ids','loss_mask')}
+        pressure['input_ids'][0] = token
+        client.fetch(client.submit(case_id+f'-pressure-{index}',pressure,force_full=True)[0],pressure)
+    after = coverage()
+    if after[0]['coverage'] != 0:
+        raise AssertionError('real HS pressure did not evict the target prefix')
+    return {'requests':needed, 'distinct_first_tokens':first_tokens[:needed],
+            'before':before, 'after':after}
+
+
 def run(config, directory):
     from actual_faults.launcher import start, drive, execute
     from actual_faults.scenarios import (Client, arm, command, rank_events, assert_fault_receipts,
@@ -228,15 +251,10 @@ def run(config, directory):
                         case['ordinary_kv_probes']=client.warm_ordinary_checkpoint(query,case_id)
                         case['kv_pin_receipts']=command(directory,'pin_kv',tp_size=tp,timeout=timeout,tokens=query['input_ids'],pin_id=pin_id)
                         try:
-                            import math
-                            needed=math.ceil(capacity/(len(base['input_ids'])*row_bytes))+4
-                            for index in range(needed):
-                                checks=command(directory,'coverage',tp_size=tp,timeout=timeout,tokens=query['input_ids'])
-                                if checks[0]['coverage']==0:break
-                                pressure={name:list(base[name]) for name in ('input_ids','loss_mask')}
-                                pressure['input_ids'][0]=1+(index+17)%127
-                                client.fetch(client.submit(case_id+f'-pressure-{index}',pressure,force_full=True)[0],pressure)
-                            else:raise AssertionError('real HS pressure did not evict the target prefix')
+                            case['pressure_receipts']=apply_hs_pressure(
+                                client,case_id,query,base,capacity=capacity,row_bytes=row_bytes,
+                                coverage=lambda:command(directory,'coverage',tp_size=tp,
+                                    timeout=timeout,tokens=query['input_ids']))
                         finally:
                             command(directory,'release_kv',tp_size=tp,timeout=timeout,pin_id=pin_id)
                     arm(directory,case_id,'coverage',rid,sample_id,[])
