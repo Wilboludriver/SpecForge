@@ -31,7 +31,7 @@ from performance_helpers import (GROUPS, WORKLOADS, OFFICIAL_PATCH_SHA256, Proce
     aggregate_capture, aggregate_training, append_json, build_workload, canonical_digest,
     comparison_contract, compare_runs, content_fingerprint, isolate_config, load_rows, rewrite_capture_argv,
     rewrite_worker_argv, validate_rdma_proof, write_json, optimizer_step_number,
-    serialize_for_epoch_order, audit_consumed_order)
+    serialize_for_epoch_order, audit_consumed_order, assigned_gpu_indices)
 
 OFFICIAL_SF = '716b02d7bf886cf5761685c0e57de887814ff15f'
 OFFICIAL_SG = '74be0a60ebfcc7d8e261096bca445ac51e383f03'
@@ -595,7 +595,8 @@ def run_owned_probe(popen, argv, *, env, terminate, timeout_s, grace_s):
                   exited_group_leaders=[probe] if probe.poll() is not None else [])
 
 
-def finish_owned_run(launch_module, real_stop, started_services, processes, sampler, run_dir, *, grace_s):
+def finish_owned_run(launch_module, real_stop, started_services, processes, sampler, run_dir, *, grace_s,
+                     result=None,workload=None):
     """Attempt every cleanup phase even if an earlier phase raises/interruption repeats."""
     errors=[]
     def attempt(label, operation):
@@ -610,6 +611,9 @@ def finish_owned_run(launch_module, real_stop, started_services, processes, samp
     sampler_status=attempt('sampler',sampler.stop)
     attempt('exit records',lambda:write_json(Path(run_dir)/'owned-processes-final.json',
         [{'pid':p.pid,'exit':p.poll()} for p in processes]))
+    if result is not None:
+        result['resource_sampler']=sampler_status or {}
+        attempt('final resource observations',lambda:finalize_resource_observations(run_dir,result,workload))
     if errors:raise RuntimeError('owned run cleanup failed: '+'; '.join(errors))
     if any(process.poll() is None for process in processes):
         raise RuntimeError('owned child remained live after cleanup')
@@ -671,7 +675,7 @@ def summarize(run_dir, workload, group):
             'capture':aggregate_capture(captures),'actual_fit':fits[0],
             'initial_draft':_load_events(run_dir,'draft-initial'),
             'validation_wall_s':sum(row['validation_wall_s'] for row in _load_events(run_dir,'fetch-validation') if row['sample_id'] in used),
-            'owned_resource_peaks_boundary':'observed process-tree PSS and per-process GPU physical-used sampling; not exact allocator peaks',
+            'owned_resource_peaks_boundary':'owned process-tree PSS/per-process GPU sampling through sampler drain; assigned-device totals include unattributed/platform memory; sampled bounds, not exact peaks',
             'server_stage_attribution':{}}
     for row in _load_events(run_dir,'server-stages'):
         ids=row.get('sample_ids',[])
@@ -686,11 +690,6 @@ def summarize(run_dir, workload, group):
             raise AssertionError('device group lacks successful actual model CUDA publication source proof')
     result['training']['optimizer_step_wall_s'] = fits[0]['measured_fit_boundary_wall_s']/workload['measured_steps']
     result['training']['primary_boundary'] = 'actual optimizer callback boundaries after warmup; validation and production logging included'
-    resources=_load_resource_samples(Path(run_dir)/'resources.jsonl')
-    result['observed_resources']=resources
-    first_boundary=next(row['monotonic'] for row in steps if row['step']==warmup)
-    last_boundary=next(row['monotonic'] for row in steps if row['step']==end)
-    result['measured_window_observed_resources']=_load_resource_samples(Path(run_dir)/'resources.jsonl',window=(first_boundary,last_boundary))
     if workload['kind']=='cold':
         if any(row['L']!=0 for row in captures):raise AssertionError('cold-prefix stream reused a supposedly unique prefix')
         first=next((row for row in steps if row['step']==1),None)
@@ -698,6 +697,24 @@ def summarize(run_dir, workload, group):
             'first_optimizer_boundary_wall_s': first['fit_elapsed_s'] if first else None,
             'boundary':'primary = distinct cold-prefix stream after trainer warmup; whole-command and first optimizer boundary separately include startup/JIT'}
     return result
+
+
+def finalize_resource_observations(run_dir, result, workload):
+    """Read the immutable sampler log only after its writer has drained."""
+    if result.get('resource_sampler',{}).get('thread_drained') is not True:
+        result['resource_observation_error']='sampler drain unproven; final resource aggregation unavailable'
+        return
+    path=Path(run_dir)/'resources.jsonl'
+    result['observed_resources']=_load_resource_samples(path)
+    # Failed startup/worker runs retain whole-lifetime observations without
+    # inventing a completed optimizer measurement window.
+    if 'actual_fit' not in result:
+        return
+    steps=_load_events(run_dir,'training-steps')
+    warmup=workload['training_warmup_steps'];end=warmup+workload['measured_steps']
+    first=next(row['monotonic'] for row in steps if row['step']==warmup)
+    last=next(row['monotonic'] for row in steps if row['step']==end)
+    result['measured_window_observed_resources']=_load_resource_samples(path,window=(first,last))
 
 
 def _load_resource_samples(path,window=None):
@@ -726,12 +743,52 @@ def _load_resource_samples(path,window=None):
     gpu_partial=[sum(p['physical_used_bytes'] for p in row['gpu']) for row in rows
         if row['gpu'] and not (row.get('gpu_query_complete',False) and row.get('owned_tree_complete',True))]
     gpu_complete=sum(row.get('gpu_query_complete',False) and row.get('owned_tree_complete',True) for row in rows)
+    gpu_unavailable={}
+    for row in rows:
+        if not row['gpu']:
+            reason=row.get('gpu_query',{}).get('availability','no_raw_query_diagnostic')
+            gpu_unavailable[reason]=gpu_unavailable.get(reason,0)+1
+    device_totals=[];device_peaks={};device_complete=0;assignment=None
+    for row in rows:
+        devices=row.get('assigned_gpu_devices',[])
+        expected=row.get('assigned_gpu_indices',[])
+        if expected:
+            if assignment is None:assignment=set(expected)
+            elif set(expected)!=assignment:raise AssertionError('assigned GPU set changed during resource sampling')
+        for device in devices:
+            value=device.get('physical_total_used_bytes')
+            if device['index'] not in expected or not isinstance(value,int) or isinstance(value,bool) or value<0:
+                continue
+            previous=device_peaks.setdefault(device['index'],{'gpu_uuid':device['gpu_uuid'],'peak_bytes':None,'complete_samples':0})
+            if previous['gpu_uuid']!=device['gpu_uuid']:
+                raise AssertionError('assigned GPU UUID changed during resource sampling')
+            previous['peak_bytes']=max(previous['peak_bytes'] or 0,value)
+            previous['complete_samples']+=1
+        valid=(bool(expected) and row.get('gpu_device_query_complete',False)
+               and {device['index'] for device in devices}==set(expected)
+               and all(isinstance(device.get('physical_total_used_bytes'),int)
+                       and not isinstance(device['physical_total_used_bytes'],bool)
+                       and device['physical_total_used_bytes']>=0 for device in devices))
+        if not valid:
+            continue
+        device_complete+=1
+        device_totals.append(sum(device['physical_total_used_bytes'] for device in devices))
     errors=[error for row in rows for error in row.get('errors',[])]
     intervals=[b['monotonic']-a['monotonic'] for a,b in zip(rows,rows[1:])]
     return {**peaks,'host_metric_coverage':coverage,
         'gpu_physical_used_sum_peak_bytes':max(gpu_values,default=None),
         'sample_count':len(rows),'gpu_samples_with_values':len(gpu_values)+len(gpu_partial),'gpu_complete_samples_with_values':len(gpu_values),
         'gpu_partial_known_sum_peak_bytes':max(gpu_partial,default=None),'gpu_query_complete_samples':gpu_complete,
+        'gpu_unavailable_reason_counts':gpu_unavailable,
+        'assigned_device_physical_total_sum_peak_bytes':max(device_totals,default=None),
+        'assigned_device_physical_total_peak_bytes':device_peaks,
+        'assigned_device_total_complete_samples':device_complete,
+        'assigned_device_total_unavailable_samples':len(rows)-device_complete,
+        'assigned_device_total_complete_fraction':device_complete/len(rows) if rows else 0.,
+        'assigned_device_total_observation_complete':len(rows)>=2 and device_complete==len(rows),
+        'assigned_device_total_boundary':'physical memory.used over assigned target/draft GPUs, including unattributed/platform memory; not owned process memory',
+        'assigned_device_attributable_owned_peak_bytes':None,
+        'assigned_device_ownership_proven':False,
         'host_pss_complete_samples':coverage['pss_bytes']['complete_samples'],
         'host_memory_comparison_eligible':len(rows)>=2 and all(item['complete_samples']==len(rows) for item in coverage.values()) and not errors,
         'gpu_memory_comparison_eligible':len(rows)>=2 and len(gpu_values)==len(rows) and gpu_complete==len(rows) and not errors,
@@ -847,7 +904,7 @@ def main(argv=None):
             'python':sys.executable,'harness_sha256':hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
             'helpers_sha256':hashlib.sha256(SCRIPT.with_name('performance_helpers.py').read_bytes()).hexdigest(),
             'harness_git_commit':subprocess.check_output(['git','-C',str(SCRIPT.parents[2]),'rev-parse','HEAD'],text=True).strip(),
-            'physical_sampler':'owned process trees only, 100ms observed PSS/GPU peaks',
+            'physical_sampler':'owned process trees and separate unattributed assigned-device totals; 100ms requested interval, observed intervals/coverage reported',
             'measurement_boundary':'actual CLI fit+loader+optimizer, full per-get validation overhead included; isolated capture never substituted'})
         (run_dir/'launch-plan.json').write_text(plan.render())
         if not args.execute:
@@ -858,7 +915,7 @@ def main(argv=None):
             proof=json.loads(Path(args.rdma_proof).read_text());validate_rdma_proof(proof,expected_devices=args.rdma_devices)
             if proof.get('boot_id')!=Path('/proc/sys/kernel/random/boot_id').read_text().strip():raise ValueError('stale-boot device proof')
         from types import SimpleNamespace
-        sampler=ProcessSampler(run_dir/'resources.jsonl')
+        sampler=ProcessSampler(run_dir/'resources.jsonl',assigned_gpus=assigned_gpu_indices(cfg_dict))
         sampler.add('orchestrator',SimpleNamespace(pid=os.getpid(),poll=lambda:None))
         processes=[];warmed=False
         parent_env={key:base_env[key] for key in ('PLANA_PERF_RUN_DIR','PLANA_PERF_WORKLOAD_JSON','PLANA_PERF_SCHEMA_JSON')}
@@ -907,7 +964,7 @@ def main(argv=None):
         finally:
             launch_module._stop_services=real_stop
             result['resource_sampler']=finish_owned_run(launch_module,real_stop,started_services,processes,sampler,run_dir,
-                grace_s=plan.shutdown_grace_s)
+                grace_s=plan.shutdown_grace_s,result=result,workload=workload)
         return 0
     except BaseException as exc:
         result.update(passed=False,status='unavailable' if isinstance(exc,DevicePublicationUnavailable) else 'failed',error=f'{type(exc).__name__}: {exc}')
