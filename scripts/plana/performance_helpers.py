@@ -283,10 +283,54 @@ def _resource_error(phase, exc, **context):
     return {'phase': phase, 'error': f'{type(exc).__name__}: {exc}', **context}
 
 
+def parse_compute_processes(output):
+    """Retain all reported GPU users; malformed rows cannot vanish silently."""
+    rows=[]
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts=[part.strip() for part in line.split(',')]
+        if len(parts)!=3 or not parts[0].isdigit() or not parts[2]:
+            raise ValueError(f'malformed nvidia-smi compute process row: {line!r}')
+        rows.append({'pid':int(parts[0]),'physical_used_bytes':int(parts[1])<<20 if parts[1].isdigit() else None,
+                     'gpu_uuid':parts[2],'memory_raw':parts[1]})
+    return rows
+
+
+def parse_gpu_devices(output):
+    rows=[]
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts=[part.strip() for part in line.split(',')]
+        if len(parts)!=3 or not parts[0].isdigit() or not parts[1]:
+            raise ValueError(f'malformed nvidia-smi device row: {line!r}')
+        rows.append({'index':parts[0],'gpu_uuid':parts[1],
+                     'physical_total_used_bytes':int(parts[2])<<20 if parts[2].isdigit() else None,
+                     'memory_raw':parts[2]})
+    if len({row['index'] for row in rows})!=len(rows) or len({row['gpu_uuid'] for row in rows})!=len(rows):
+        raise ValueError('duplicate nvidia-smi device index/UUID')
+    return rows
+
+
+def assigned_gpu_indices(config):
+    managed=config['deployment']['disaggregated']['managed_local']
+    values=list(managed['trainer_cuda_visible_devices'])
+    for server in managed['capture_servers']:
+        values.extend(server['cuda_visible_devices'])
+    if not values or any(not str(value).isdigit() or isinstance(value,bool) for value in values):
+        raise ValueError('physical numeric assigned GPU indices required for resource sampling')
+    return tuple(sorted({str(int(value)) for value in values},key=int))
+
+
+def process_start_time(pid):
+    stat=(Path('/proc')/str(pid)/'stat').read_text().rsplit(')',1)[1].split()
+    return int(stat[19])
+
+
 def read_process_sample(pid):
     base = Path('/proc') / str(pid)
-    stat = (base / 'stat').read_text().rsplit(')', 1)[1].split()
-    start_time = int(stat[19])
+    start_time=process_start_time(pid)
     fields, errors, sources = {}, [], {}
     for name in ('status', 'smaps_rollup'):
         try:
@@ -299,6 +343,8 @@ def read_process_sample(pid):
         except (OSError, ProcessLookupError) as exc:
             sources[name] = False
             errors.append(_resource_error(name, exc, pid=pid))
+    if process_start_time(pid)!=start_time:
+        raise ProcessLookupError('PID start time changed while reading process memory')
     return {'pid': pid, 'start_time': start_time, 'rss_bytes': fields.get('VmRSS'),
             'pss_bytes': fields.get('Pss'), 'locked_bytes': fields.get('VmLck'), 'hwm_bytes': fields.get('VmHWM'),
             'sources': sources, 'read_errors': errors}
@@ -306,8 +352,11 @@ def read_process_sample(pid):
 
 class ProcessSampler:
     """Sample owned trees, with explicit unavailable values and failure coverage."""
-    def __init__(self, output, interval=.1):
+    def __init__(self, output, interval=.1, *, assigned_gpus=()):
         self.output, self.interval = Path(output), interval
+        self.assigned_gpus=tuple(str(value) for value in assigned_gpus)
+        if len(set(self.assigned_gpus))!=len(self.assigned_gpus) or any(not value.isdigit() for value in self.assigned_gpus):
+            raise ValueError('unique physical numeric assigned GPU indices required')
         self.roots, self.identities = {}, {}
         self.lock, self.stop_event = threading.Lock(), threading.Event()
         self.fatal_errors, self.sample_count = [], 0
@@ -365,26 +414,74 @@ class ProcessSampler:
             except (OSError, ProcessLookupError) as exc:
                 errors.append(_resource_error('host', exc, pid=pid))
         gpu, gpu_query_complete = [], False
+        gpu_query={'returncode':None,'stdout':None,'stderr':None,'reported_processes':[],
+                   'unmatched_processes':[],'same_numeric_pid_candidates':[],
+                   'pid_namespace_identity_proven':False,'availability':'query_not_completed'}
         try:
             result = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,used_gpu_memory,gpu_uuid',
                                      '--format=csv,noheader,nounits'], text=True, capture_output=True, timeout=2)
+            gpu_query.update(returncode=result.returncode,stdout=result.stdout,stderr=getattr(result,'stderr',''))
             if result.returncode == 0:
                 gpu_query_complete = True
-                for line in result.stdout.splitlines():
-                    parts = [part.strip() for part in line.split(',')]
-                    if len(parts) == 3 and parts[0].isdigit() and int(parts[0]) in owned:
-                        if parts[1].isdigit():
-                            gpu.append({'pid': int(parts[0]), 'physical_used_bytes': int(parts[1]) << 20, 'gpu_uuid': parts[2]})
-                        else:
-                            gpu_query_complete = False
-                            errors.append({'phase': 'gpu', 'pid': int(parts[0]), 'error': 'physical used GPU memory unavailable'})
+                reported=parse_compute_processes(result.stdout)
+                gpu_query['reported_processes']=reported
+                gpu_query['unmatched_processes']=[row for row in reported if row['pid'] not in owned]
+                for row in reported:
+                    if row['pid'] not in owned:
+                        continue
+                    host=next((record for record in records if record['pid']==row['pid']),None)
+                    if host is None or process_start_time(row['pid'])!=host['start_time']:
+                        gpu_query_complete=False
+                        errors.append({'phase':'gpu_identity','pid':row['pid'],
+                                       'error':'GPU process PID/start identity not proven by owned host observation'})
+                        continue
+                    # The actual visibility diagnostic proves NVML and /proc
+                    # PIDs differ here. Even a numeric collision is not an
+                    # identity proof. Retain candidates without attributing
+                    # their memory to an owned process.
+                    gpu_query['same_numeric_pid_candidates'].append({**row,'local_start_time':host['start_time']})
+                    if row['physical_used_bytes'] is None:
+                        gpu_query_complete = False
+                        errors.append({'phase':'gpu','pid':row['pid'],'error':'physical used GPU memory unavailable',
+                                       'memory_raw':row['memory_raw']})
+                gpu_query['availability']=('no_reported_compute_processes' if not reported else
+                    'nvml_pid_namespace_identity_unverified' if gpu_query['same_numeric_pid_candidates'] else
+                    'no_owned_compute_process_values')
             else:
                 errors.append({'phase': 'gpu', 'error': f'nvidia-smi exit {result.returncode}'})
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired,ValueError) as exc:
+            gpu_query_complete=False
             errors.append(_resource_error('gpu', exc))
+        devices=[];device_query_complete=False
+        device_query={'returncode':None,'stdout':None,'stderr':None}
+        if self.assigned_gpus:
+            try:
+                result=subprocess.run(['nvidia-smi','--query-gpu=index,uuid,memory.used',
+                    '--format=csv,noheader,nounits'],text=True,capture_output=True,timeout=2)
+                device_query.update(returncode=result.returncode,stdout=result.stdout,stderr=getattr(result,'stderr',''))
+                if result.returncode!=0:
+                    raise RuntimeError(f'nvidia-smi device query exit {result.returncode}')
+                available=parse_gpu_devices(result.stdout)
+                devices=[row for row in available if row['index'] in self.assigned_gpus]
+                if len(devices)!=len(self.assigned_gpus):
+                    raise ValueError('assigned GPU missing from physical device query')
+                if any(row['physical_total_used_bytes'] is None for row in devices):
+                    raise ValueError('assigned GPU physical total used memory unavailable')
+                device_query_complete=True
+                for device in devices:
+                    users=[row for row in gpu_query['reported_processes'] if row['gpu_uuid']==device['gpu_uuid']]
+                    device.update(reported_compute_user_pids=[row['pid'] for row in users],
+                        all_reported_compute_pids_numerically_match_owned_tree=bool(users) and all(row['pid'] in owned for row in users),
+                        ownership_proven=False,attributable_owned_physical_bytes=None,
+                        ownership_reason='device totals include unattributed/platform memory; compute-app enumeration alone is not proof of all device users')
+            except (OSError,subprocess.TimeoutExpired,ValueError,RuntimeError) as exc:
+                errors.append(_resource_error('gpu_device',exc))
         append_json(self.output, {'time': time.time(), 'monotonic': time.perf_counter(), 'host': records, 'gpu': gpu,
             'owned_process_count': len(owned), 'owned_tree_complete': tree_complete,
-            'gpu_query_complete': gpu_query_complete, 'errors': errors, 'sample_interval_s': self.interval})
+            'gpu_query_complete': gpu_query_complete,'gpu_query':gpu_query,
+            'assigned_gpu_indices':self.assigned_gpus,'assigned_gpu_devices':devices,
+            'gpu_device_query_complete':device_query_complete,'gpu_device_query':device_query,
+            'errors': errors, 'sample_interval_s': self.interval})
         self.sample_count += 1
 
     def _run(self):
