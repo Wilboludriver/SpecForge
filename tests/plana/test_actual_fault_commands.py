@@ -105,6 +105,22 @@ class CommandTests(unittest.TestCase):
                     body=call.kwargs['json_body']
                     self.assertEqual(body['input_ids'],row['input_ids'])
                     self.assertEqual(body['extra_key'],'ns');self.assertNotIn('spec_capture',body)
+    def test_probe_uses_real_Req_array_container_with_unchanged_N_minus_one(self):
+        from array import array
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        tokens=[1,2,3,4]
+        state=object.__new__(RankState);state.bridge=SimpleNamespace(namespace='ns')
+        observed=[]
+        def match(params):
+            observed.append(params)
+            stored=RadixKey(array('q',tokens),extra_key='ns')
+            return stored.match(params.key)
+        state.scheduler=SimpleNamespace(tree_cache=SimpleNamespace(match_prefix=match))
+        self.assertEqual(state.probe_kv(tokens),len(tokens)-1)
+        self.assertIs(type(observed[0].key.token_ids),array)
+        self.assertFalse(observed[0].cow_mamba);self.assertIsNone(observed[0].req)
+        with self.assertRaises(AssertionError):
+            RadixKey(array('q',tokens),extra_key='ns').match(RadixKey(tokens,extra_key='ns'))
 
 
 if __name__=='__main__':unittest.main()
