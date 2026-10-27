@@ -55,7 +55,15 @@ def validate_outcome(cases, diagnostics, actions):
     if diagnostics[6]['L'] != 0:
         raise AssertionError('KV-only fixture reused a missing HS prefix')
     later = actions['later_checkpoint_probe']
-    if not later['cached_tokens'] > diagnostics[2]['H'] or later['has_spec_capture'] or not later['hs_cache_unchanged']:
+    probes = later['probes']
+    N = len(cases[2]['input_ids'])
+    if not 1 <= len(probes) <= 2:
+        raise AssertionError('later checkpoint proof requires one or two bounded ordinary probes')
+    for probe in probes:
+        if (probe['input_ids'] != cases[2]['input_ids'] or not 0 <= probe['cached_tokens'] < N
+                or probe['has_spec_capture'] or not probe['hs_cache_unchanged']):
+            raise AssertionError('later checkpoint probe changed bounded request identity, legality or HS cache')
+    if not diagnostics[2]['H'] < probes[-1]['cached_tokens'] < N:
         raise AssertionError('bounded-H fixture did not prove a later ordinary usable engine checkpoint')
     flush, ordinary = actions['engine_flush'], actions['ordinary_uncaptured_kv']
     if flush['status'] != 200 or not flush['hs_cache_unchanged']:
