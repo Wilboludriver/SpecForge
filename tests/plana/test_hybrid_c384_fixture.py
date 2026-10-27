@@ -15,6 +15,7 @@ class HybridC384OracleTests(unittest.TestCase):
         diagnostics = [{'H': h, 'L': l, 'N': len(row['input_ids']), 'span': [l, len(row['input_ids'])], 'reused_tokens': l}
                        for row, h, l in zip(cases, (0, 0, 384, 768, 768, 0, 0), (0, 0, 192, 448, 0, 0, 0), strict=True)]
         actions = {'engine_flush': {'status': 200, 'hs_cache_unchanged': True},
+                   'later_checkpoint_probe': {'cached_tokens': 960, 'has_spec_capture': False, 'hs_cache_unchanged': True},
                    'ordinary_uncaptured_kv': {'cached_tokens': 960, 'has_spec_capture': False, 'hs_cache_unchanged': True}}
         return cases, diagnostics, actions
 
@@ -27,14 +28,15 @@ class HybridC384OracleTests(unittest.TestCase):
         self.assertEqual(fixture.validate_outcome(cases, diagnostics, actions)['actual_L'][2], 256)
 
     def test_missing_causes_or_false_kv_claim_fail(self):
-        for mode in ('maximal-L', 'flush-reuse', 'lost-HS', 'no-KV', 'captured-KV', 'KV-changes-HS'):
+        for mode in ('maximal-L', 'flush-reuse', 'lost-HS', 'no-KV', 'captured-KV', 'KV-changes-HS', 'no-later-checkpoint'):
             cases, diagnostics, actions = self.evidence()
             if mode == 'maximal-L': diagnostics[2]['L'] = diagnostics[2]['H']
             elif mode == 'flush-reuse': diagnostics[4]['L'] = 64
             elif mode == 'lost-HS': actions['engine_flush']['hs_cache_unchanged'] = False
             elif mode == 'no-KV': actions['ordinary_uncaptured_kv']['cached_tokens'] = 0
             elif mode == 'captured-KV': actions['ordinary_uncaptured_kv']['has_spec_capture'] = True
-            else: actions['ordinary_uncaptured_kv']['hs_cache_unchanged'] = False
+            elif mode == 'KV-changes-HS': actions['ordinary_uncaptured_kv']['hs_cache_unchanged'] = False
+            else: actions['later_checkpoint_probe']['cached_tokens'] = 384
             with self.subTest(mode=mode), self.assertRaises(AssertionError):
                 fixture.validate_outcome(cases, diagnostics, actions)
 

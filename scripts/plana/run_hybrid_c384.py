@@ -92,7 +92,7 @@ def main():
             return capability, value
 
         def before_case(adapter, index, row):
-            if index not in (4, 6):
+            if index not in (2, 4, 6):
                 return
             capability, before = stats(adapter)
             if before['cache']['ready_blocks'] != 2:
@@ -105,12 +105,14 @@ def main():
                                            'before': before, 'after': after,
                                            'hs_cache_unchanged': cache_snapshot(before) == cache_snapshot(after)}
             else:
+                probe_row = rows[1] if index == 2 else row
                 response = ordinary_post(adapter.base_url + '/generate', json_body={
-                    'input_ids': row['input_ids'], 'extra_key': capability['capture_namespace'],
+                    'input_ids': probe_row['input_ids'], 'extra_key': capability['capture_namespace'],
                     'sampling_params': {'temperature': 0.0, 'max_new_tokens': 0}}, timeout=60)
                 meta = response['meta_info']
                 _, after = stats(adapter)
-                actions['ordinary_uncaptured_kv'] = {'response': response,
+                action = 'later_checkpoint_probe' if index == 2 else 'ordinary_uncaptured_kv'
+                actions[action] = {'response': response,
                     'cached_tokens': meta['cached_tokens'], 'has_spec_capture': 'spec_capture' in meta,
                     'before': before, 'after': after,
                     'hs_cache_unchanged': cache_snapshot(before) == cache_snapshot(after)}

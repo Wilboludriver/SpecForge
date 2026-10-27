@@ -54,6 +54,9 @@ def validate_outcome(cases, diagnostics, actions):
         raise AssertionError('engine flush did not force HS-only restore to L0')
     if diagnostics[6]['L'] != 0:
         raise AssertionError('KV-only fixture reused a missing HS prefix')
+    later = actions['later_checkpoint_probe']
+    if not later['cached_tokens'] > diagnostics[2]['H'] or later['has_spec_capture'] or not later['hs_cache_unchanged']:
+        raise AssertionError('bounded-H fixture did not prove a later ordinary usable engine checkpoint')
     flush, ordinary = actions['engine_flush'], actions['ordinary_uncaptured_kv']
     if flush['status'] != 200 or not flush['hs_cache_unchanged']:
         raise AssertionError('HS-only fixture did not preserve ready HS across engine flush')
