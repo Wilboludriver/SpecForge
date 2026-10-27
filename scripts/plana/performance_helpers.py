@@ -4,6 +4,8 @@ from __future__ import annotations
 import copy
 from collections import Counter
 import hashlib
+import functools
+import inspect
 import json
 import math
 import os
@@ -17,6 +19,72 @@ GROUPS = ('device-off', 'host-off', 'host-on', 'candidate-host-off')
 WORKLOADS = ('cold', 'hot', 'over-capacity', 'real64')
 STAGES = ('forward_ms', 'd2h_wait_ms', 'assembly_ms', 'cache_fill_ms', 'publication_queue_ms')
 OFFICIAL_PATCH_SHA256 = '8182e4eac902b4009f4d0314c3b6a9e71543faeac5412e3032b8741ec35537a8'
+POLL_DEFAULTS = {'producer_backpressure_poll_s': 0.2, 'consumer_ref_poll_s': 0.1,
+                 'ref_distributor_poll_s': 0.05}
+POLL_SOURCES = {
+    'producer_backpressure_poll_s': ('specforge/launch.py', 'specforge.launch.build_disagg_online_producer'),
+    'consumer_ref_poll_s': ('specforge/runtime/data_plane/streaming_ref_channel.py',
+                          'specforge.runtime.data_plane.streaming_ref_channel.StreamingRefQueue.__init__'),
+    'ref_distributor_poll_s': ('specforge/runtime/data_plane/ref_distributor.py',
+                             'specforge.runtime.data_plane.ref_distributor.RefDistributor.__init__')}
+
+
+def validate_polling_policy(policy):
+    if set(policy) != set(POLL_DEFAULTS):
+        raise ValueError('all three explicit polling intervals are required')
+    result = {}
+    for name, value in policy.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f'{name} must be positive and finite')
+        result[name] = float(value)
+    return result
+
+
+def polling_policy_call(original, *, argument, field, value, mode, emit):
+    """Apply the declared policy through real APIs; never repair candidate wiring."""
+    if mode not in ('official-api', 'candidate-config'):
+        raise ValueError('unknown polling policy application mode')
+    signature = inspect.signature(original)
+    if argument not in signature.parameters:
+        raise ValueError(f'actual callable has no polling parameter: {argument}')
+    @functools.wraps(original)
+    def call(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        supplied = argument in bound.arguments
+        if mode == 'candidate-config' and not supplied:
+            raise AssertionError(f'candidate config did not reach {field}')
+        if supplied and (isinstance(bound.arguments[argument], bool) or bound.arguments[argument] != value):
+            raise AssertionError(f'actual polling argument conflicts with policy: {field}')
+        bound.arguments[argument] = value
+        result = original(*bound.args, **bound.kwargs)
+        # Both queue/distributor constructors retain the effective interval.
+        if argument == 'poll_s' and getattr(bound.arguments.get('self'), 'poll_s', None) != value:
+            raise AssertionError(f'constructed object ignored {field}')
+        emit({'field': field, 'value': value, 'mode': mode, 'explicit_from_caller': supplied,
+              'callable': original.__module__+'.'+original.__qualname__,
+              'source_file': inspect.getsourcefile(original), 'applied': True})
+        return result
+    return call
+
+
+def audit_polling_receipts(records, policy, mode, *, source_root=None):
+    policy = validate_polling_policy(policy)
+    seen = set()
+    for row in records:
+        field = row.get('field')
+        if (field not in policy or row.get('value') != policy[field] or row.get('mode') != mode
+                or row.get('applied') is not True or not row.get('source_file')
+                or (mode == 'candidate-config' and row.get('explicit_from_caller') is not True)):
+            raise AssertionError('invalid actual polling application receipt')
+        relative, callable_name = POLL_SOURCES[field]
+        if row.get('callable') != callable_name:
+            raise AssertionError('polling receipt names the wrong component callable')
+        if source_root is not None and Path(row['source_file']).resolve() != (Path(source_root)/relative).resolve():
+            raise AssertionError('polling receipt source differs from the frozen source')
+        seen.add(field)
+    if seen != set(policy):
+        raise AssertionError('actual run lacks one or more polling application receipts')
+    return {'policy': policy, 'mode': mode, 'all_components_verified': True, 'receipts': records}
 
 
 def canonical_digest(value):
@@ -513,10 +581,17 @@ class ProcessSampler:
             self.stop_event.set()
 
 
-def comparison_contract(config, workload_sha, schema, cache_bytes, chunk_tokens):
+def comparison_contract(config, workload_sha, schema, cache_bytes, chunk_tokens, *, polling_policy=None):
     value = copy.deepcopy(config)
     value.pop('run_id', None)
     value.pop('output_dir', None)
+    if polling_policy is not None:
+        policy = validate_polling_policy(polling_policy)
+        runtime = value.setdefault('runtime', {})
+        for field, interval in policy.items():
+            if field in runtime and runtime[field] != interval:
+                raise ValueError(f'config contradicts common polling policy: {field}')
+            runtime[field] = interval
     value['data']['prompts_path'] = workload_sha
     value['data']['cache_dir'] = '<isolated>'
     disagg = value['deployment']['disaggregated']

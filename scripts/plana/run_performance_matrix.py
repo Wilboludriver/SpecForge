@@ -113,6 +113,10 @@ def harness_command(matrix,case,run_dir,*,execute=False,rdma_proof=None):
         '--warmup-steps',str(matrix['warmup_steps']),'--steps',str(case['measured_steps']),
         '--cache-bytes',str(matrix['cache_bytes']),'--chunk-tokens',str(matrix['chunk_tokens']),
         '--rdma-probe-timeout-s',str(matrix['bounds']['rdma_probe_timeout_s'])]
+    if 'polling_policy' in matrix:
+        from performance_helpers import validate_polling_policy
+        for field,value in validate_polling_policy(matrix['polling_policy']).items():
+            argv.extend(['--'+field.replace('_','-'),str(value)])
     if case['transport']=='rdma':
         argv.extend(['--rdma-devices',matrix['rdma_devices']])
         if execute and case['group']!='device-off':
