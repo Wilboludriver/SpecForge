@@ -53,7 +53,7 @@ class ProtocolServer:
                     return dict(entry)
                 entry['writer_drained'] = self.drained
                 if body.get('cancel'):
-                    entry['state'] = 'WRITER_DRAINED' if self.drained else 'DRAINING' 
+                    entry['state'] = 'WRITER_DRAINED' if self.drained else 'DRAINING'
                 return dict(entry)
             if action == 'read_acquire':
                 if entry['state'] != 'PUBLISHED' or entry['cleanup_token']:
