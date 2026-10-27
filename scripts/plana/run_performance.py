@@ -31,7 +31,8 @@ from performance_helpers import (GROUPS, WORKLOADS, OFFICIAL_PATCH_SHA256, Proce
     aggregate_capture, aggregate_training, append_json, build_workload, canonical_digest,
     comparison_contract, compare_runs, content_fingerprint, isolate_config, load_rows, rewrite_capture_argv,
     rewrite_worker_argv, validate_rdma_proof, write_json, optimizer_step_number,
-    serialize_for_epoch_order, audit_consumed_order, assigned_gpu_indices, performance_run_id)
+    serialize_for_epoch_order, audit_consumed_order, assigned_gpu_indices, performance_run_id,
+    POLL_DEFAULTS, validate_polling_policy, polling_policy_call, audit_polling_receipts)
 
 OFFICIAL_SF = '716b02d7bf886cf5761685c0e57de887814ff15f'
 OFFICIAL_SG = '74be0a60ebfcc7d8e261096bca445ac51e383f03'
@@ -226,6 +227,21 @@ def _validate_sample(ref, features, workload, schema):
     return fingerprint
 
 
+def install_polling_policy():
+    """Official uses its existing callable APIs; candidate must use its config."""
+    import specforge.launch as launch
+    from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefQueue
+    from specforge.runtime.data_plane.ref_distributor import RefDistributor
+    policy = validate_polling_policy(json.loads(os.environ['PLANA_PERF_POLL_POLICY']))
+    mode = os.environ['PLANA_PERF_POLL_MODE']
+    for owner, name, argument, field in (
+        (launch, 'build_disagg_online_producer', 'backpressure_poll_s', 'producer_backpressure_poll_s'),
+        (StreamingRefQueue, '__init__', 'poll_s', 'consumer_ref_poll_s'),
+        (RefDistributor, '__init__', 'poll_s', 'ref_distributor_poll_s')):
+        setattr(owner, name, polling_policy_call(getattr(owner, name), argument=argument,
+            field=field, value=policy[field], mode=mode, emit=lambda row: _emit('polling-policy', row)))
+
+
 def install_worker_observers():
     """Observe actual optimizer, data loader and SampleRef path in CLI workers."""
     global _INSTALLED
@@ -233,6 +249,7 @@ def install_worker_observers():
         return
     _INSTALLED = True
     verify_runtime_imports()
+    install_polling_policy()
     import torch
     from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter, _SessionPost
     from specforge.runtime.contracts import SampleRef
@@ -677,7 +694,10 @@ def summarize(run_dir, workload, group):
     if len(used)!=workload['measured_steps'] or len(captures)!=len(used):raise AssertionError('measured optimizer samples lack complete unique capture diagnostics')
     fits=_load_events(run_dir,'fit')
     if len(fits)!=1:raise AssertionError('exactly one actual training rank fit record required')
-    result={'consumed_order':consumed_order,'training':aggregate_training(steps,warmup_steps=warmup,measured_steps=workload['measured_steps']),
+    manifest=json.loads((Path(run_dir)/'manifest.json').read_text())
+    polling=audit_polling_receipts(_load_events(run_dir,'polling-policy'),manifest['polling_policy'],manifest['polling_mode'],
+                                 source_root=manifest['specforge']['root'])
+    result={'polling':polling,'consumed_order':consumed_order,'training':aggregate_training(steps,warmup_steps=warmup,measured_steps=workload['measured_steps']),
             'capture':aggregate_capture(captures),'actual_fit':fits[0],
             'initial_draft':_load_events(run_dir,'draft-initial'),
             'validation_wall_s':sum(row['validation_wall_s'] for row in _load_events(run_dir,'fetch-validation') if row['sample_id'] in used),
@@ -844,11 +864,15 @@ def main(argv=None):
     parser.add_argument('--warmup-steps',type=int,default=8);parser.add_argument('--steps',type=int,default=64)
     parser.add_argument('--cache-bytes',type=int,default=64<<20);parser.add_argument('--chunk-tokens',type=int,default=256)
     parser.add_argument('--rdma-probe-timeout-s',type=float,default=120.,help='bounded native CUDA/RDMA probe wait')
+    for field, default in POLL_DEFAULTS.items():
+        parser.add_argument('--'+field.replace('_','-'),type=float,default=default)
     parser.add_argument('--execute',action='store_true',help='requires root-assigned GPUs/ports/HCAs; default only plans')
     args=parser.parse_args(raw)
     run_dir=Path(args.run_dir).resolve();run_dir.mkdir(parents=True,exist_ok=False)
     result={'status':'planning','passed':False,'group':args.group,'workload':args.workload,'transport':args.transport}
     try:
+        polling_policy=validate_polling_policy({field:getattr(args,field) for field in POLL_DEFAULTS})
+        polling_mode='official-api' if args.group in ('device-off','host-off') else 'candidate-config'
         if not math.isfinite(args.rdma_probe_timeout_s) or args.rdma_probe_timeout_s <= 0:
             raise ValueError('positive finite RDMA probe timeout required')
         sf=git_identity(args.specforge_source,args.expected_specforge);sg=git_identity(args.sglang_source,args.expected_sglang)
@@ -875,6 +899,8 @@ def main(argv=None):
             raise ValueError('workload would be silently truncated by native reader; refusing entire run')
         cfg_dict=isolate_config(original,run_dir=run_dir,workload=workload,group=args.group,transport=args.transport,
             cache_bytes=args.cache_bytes,chunk_tokens=args.chunk_tokens,rdma_devices=args.rdma_devices)
+        if polling_mode=='candidate-config':
+            cfg_dict['runtime'].update(polling_policy)
         config_path=run_dir/'config.yaml';config_path.write_text(yaml.safe_dump(cfg_dict,sort_keys=False))
         cfg=load_config(str(config_path));resolved=resolve_run(cfg)
         if cfg.runtime.producer_concurrency != 1:
@@ -887,7 +913,8 @@ def main(argv=None):
             'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1','PLANA_PERF_RUN_DIR':str(run_dir),
             'PLANA_PERF_SPECFORGE_SOURCE':str(Path(args.specforge_source).resolve()),
             'PLANA_PERF_SGLANG_SOURCE':str(Path(args.sglang_source).resolve()),
-            'PLANA_PERF_WORKLOAD_JSON':str(run_dir/'workload.json'),'PLANA_PERF_SCHEMA_JSON':json.dumps(schema)}
+            'PLANA_PERF_WORKLOAD_JSON':str(run_dir/'workload.json'),'PLANA_PERF_SCHEMA_JSON':json.dumps(schema),
+            'PLANA_PERF_POLL_POLICY':json.dumps(polling_policy),'PLANA_PERF_POLL_MODE':polling_mode}
         if args.transport=='rdma':performance_env['MC_STORE_MEMCPY']='0'
         base_env={**os.environ,**performance_env}
         plan=build_launch_plan(resolved.config,algorithm=resolved.algorithm,config_path=str(config_path),env=base_env)
@@ -903,7 +930,9 @@ def main(argv=None):
         commands=tuple(dataclasses.replace(command,argv=rewrite_worker_argv(command.argv,SCRIPT),
             env={**performance_env,**command.env,'PLANA_PERF_ROLE':command.label}) for command in plan.commands)
         plan=dataclasses.replace(plan,commands=commands,services=tuple(services))
-        write_json(run_dir/'manifest.json',{'comparison_contract': comparison_contract(cfg_dict,workload['data_sha256'],schema,args.cache_bytes,args.chunk_tokens), 'specforge':sf,'sglang':sg,'schema':schema,'data_sha256':workload['data_sha256'],
+        write_json(run_dir/'manifest.json',{'comparison_contract': comparison_contract(cfg_dict,workload['data_sha256'],schema,args.cache_bytes,args.chunk_tokens,polling_policy=polling_policy), 'specforge':sf,'sglang':sg,'schema':schema,'data_sha256':workload['data_sha256'],
+            'polling_policy':polling_policy,'polling_mode':polling_mode,
+            'polling_boundary':'same three effective intervals; official existing Python APIs, candidate real runtime config; actual application receipts required',
             'intended_data_sha256':workload['intended_data_sha256'],'prompt_seed':workload['prompt_seed'],
             'producer_concurrency':cfg.runtime.producer_concurrency,
             'run_identity':{'run_dir':str(run_dir),'run_id':cfg.run_id,
