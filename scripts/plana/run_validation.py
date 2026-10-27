@@ -133,7 +133,7 @@ def server_drained(adapter,run_dir,require_cache):
             if value>limit:raise AssertionError(f'configured hard byte limit exceeded: {value}>{limit}')
 
 
-def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
+def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows, *, before_case=None, after_case=None):
     import torch
     from specforge.algorithms.common.providers import resolve_server_capture_layout
     from specforge.inference.adapters.server_capture import SGLangServerCaptureAdapter, ServerCaptureSchema
@@ -183,6 +183,8 @@ def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
     diagnostics = []
     try:
         for index, row in enumerate(rows):
+            if before_case is not None:
+                before_case(adapter, index, row)
             task = PromptTask(task_id=f'{index:02d}-{row["id"]}', run_id=namespace, source_id='plana-native16',
                               payload={key: row[key] for key in ('input_ids','loss_mask')}, max_length=len(row['input_ids']))
             started = time.perf_counter()
@@ -215,7 +217,9 @@ def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
             result = {"pass": pass_name, "index": index, "case": row['id'], "N": len(row['input_ids']),
                       "seconds": time.perf_counter()-started, "hashes": hashes, "keys_removed": len(keys), "ref": dataclasses.asdict(ref), "health": store.health(), "diagnostics": diagnostic}
             append_json(run_dir/'case-results.jsonl', result)
-            print(f'CAPTURE {pass_name} {index+1:02d}/16 {row["id"]} N={len(row["input_ids"])} keys_removed={len(keys)}', flush=True)
+            if after_case is not None:
+                after_case(adapter, index, row, result)
+            print(f'CAPTURE {pass_name} {index+1:02d}/{len(rows)} {row["id"]} N={len(row["input_ids"])} keys_removed={len(keys)}', flush=True)
     finally:
         cleanup_store(store, expected_keys, directory, require_fences=args.require_cache)
         server_drained(adapter,directory,args.require_cache)
@@ -370,7 +374,7 @@ def replay_gradients(args,cfg,resolved,rows,reference_paths,actual_paths,run_dir
         if not passed:
             torch.save({"reference":ref_grads,"actual":grads},run_dir/f'failure-gradients-{index:02d}.pt')
         all_passed=all_passed and passed
-        print(f'GRADIENT {index+1:02d}/16 {row["id"]} loss={float(loss):.9g} relative_l2={relative_l2:.6g} passed={passed}',flush=True)
+        print(f'GRADIENT {index+1:02d}/{len(rows)} {row["id"]} loss={float(loss):.9g} relative_l2={relative_l2:.6g} passed={passed}',flush=True)
         del outputs,ref_grads,grads,output,batch,tensors
     after=model_digest(model)
     if after!=before:
