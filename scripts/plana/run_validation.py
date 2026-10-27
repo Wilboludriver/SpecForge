@@ -87,16 +87,50 @@ def start_services(plan, run_dir):
         raise
 
 
-def cleanup_store(store, expected_keys, run_dir):
+def cleanup_store(store, expected_keys, run_dir, require_fences=False):
     store.discard_external_attempts(reason='plana-validation-finally')
     store.drain_pending_removals(max_attempts=30, retry_interval_s=.1)
     health = store.health()
     remaining = [key for key in expected_keys if store._store_exists(key)]
     write_json(run_dir/'store-final.json', {"health": health, "expected_keys": len(expected_keys), "remaining_keys": remaining})
     fields = ('resident_samples', 'provisional_external', 'active_leases', 'resident_bytes', 'release_pending', 'quarantined_buffers', 'quarantined_bytes')
+    fence_fields = ('capture_pending_begin','capture_fences','capture_ack_pending','capture_handle_attempts','capture_read_intents','capture_active_reads','capture_failed_reads')
+    if require_fences and any(name not in health for name in fence_fields):
+        raise AssertionError('negotiated store omitted attempt/read resource counters')
+    fields += tuple(name for name in fence_fields if name in health)
     if remaining or any(health[name] != 0 for name in fields):
         raise AssertionError(f"store not drained: remaining={remaining}, health={health}")
     store.close()
+
+
+
+def server_drained(adapter,run_dir,require_cache):
+    protocol=getattr(adapter,'_capture_protocol',None)
+    if protocol is None:
+        if require_cache:raise AssertionError('cache candidate did not negotiate control protocol')
+        return
+    capability=protocol.capability()
+    if capability is None:
+        if require_cache:raise AssertionError('cache candidate fell back to unknown capability')
+        return
+    if require_cache and not capability['cache_enabled']:
+        raise AssertionError('cache-on candidate capability reports cache disabled')
+    stats=protocol.call({'action':'stats','server_epoch':capability['server_epoch']})
+    write_json(run_dir/'server-final.json',stats)
+    for name in ('active_attempts','active_readers','pending_deliveries'):
+        if stats[name]!=0:raise AssertionError(f'server retained {name}: {stats}')
+    if capability['cache_enabled']:
+        limits=capability['limits'];cache=stats['cache'];controller=stats['controller']
+        for name in ('active_leases','fill_reservations','writing_blocks'):
+            if cache[name]!=0:raise AssertionError(f'cache retained {name}: {cache}')
+        for name in ('pinned_bytes','output_bytes','device_bytes','output_reservations','pending_executions','pending_copies','quarantined_executions'):
+            if controller[name]!=0:raise AssertionError(f'controller retained {name}: {controller}')
+        for value,limit in ((cache['cache_peak_bytes'],limits['cache_bytes']),
+                            (controller['pinned_peak_bytes'],limits['pinned_capacity_bytes']),
+                            (controller['pinned_arena_bytes'],limits['pinned_capacity_bytes']),
+                            (controller['output_peak_bytes'],limits['output_bytes']),
+                            (controller['device_peak_bytes'],limits['device_bytes'])):
+            if value>limit:raise AssertionError(f'configured hard byte limit exceeded: {value}>{limit}')
 
 
 def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
@@ -183,7 +217,13 @@ def capture_pass(args, cfg, resolved, plan, run_dir, pass_name, rows):
             append_json(run_dir/'case-results.jsonl', result)
             print(f'CAPTURE {pass_name} {index+1:02d}/16 {row["id"]} N={len(row["input_ids"])} keys_removed={len(keys)}', flush=True)
     finally:
-        cleanup_store(store, expected_keys, directory)
+        cleanup_store(store, expected_keys, directory, require_fences=args.require_cache)
+        server_drained(adapter,directory,args.require_cache)
+    sequences=[d['issue_sequence'] for d in diagnostics if 'issue_sequence' in d]
+    if sequences and (len(sequences)!=len(rows) or any(b<=a for a,b in zip(sequences,sequences[1:]))):
+        raise AssertionError('server-issued attempt sequence is missing or nonmonotonic')
+    identities={(d['server_epoch'],d['capture_signature'],d['capture_namespace']) for d in diagnostics if 'server_epoch' in d}
+    if len(identities)>1:raise AssertionError('server capture identity changed during one controlled pass')
     if args.require_cache and not any(d['L'] > 0 for d in diagnostics):
         raise AssertionError('cache-on candidate performed no actual prefix reuse')
     write_json(directory/'diagnostics.json', diagnostics)

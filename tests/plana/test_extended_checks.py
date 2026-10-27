@@ -22,7 +22,7 @@ class TestExtendedEvidenceChecks(unittest.TestCase):
         with self.assertRaises(AssertionError):validate_diagnostics({},100,require_cache=True)
 
     def test_h_is_not_used_as_engine_l_and_absolute_span_is_required(self):
-        result={'H':768,'L':256,'N':1024,'span':[256,1024],'execution_epoch':0,'rank':0,'attempt_id':'a',
+        result={'H':768,'L':256,'N':1024,'span':[256,1024],'execution_epoch':0,'rank':0,'issue_sequence':1,'attempt_id':'a',
                 'reservation_token':'t','server_epoch':'e','capture_signature':'s','capture_namespace':'n','reused_tokens':256}
         self.assertEqual(validate_diagnostics(result,1024,require_cache=True)['L'],256)
         for patch in ({'L':800},{'span':[0,768]},{'reused_tokens':768}):
