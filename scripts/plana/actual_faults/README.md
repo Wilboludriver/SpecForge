@@ -91,3 +91,52 @@ For actual execution use the root-owned `implementation/tools/run_actual_faults.
 The run manifest records exact clean production commits, actual import paths, complete test-tool source hashes, config, deterministic mode and unchanged predeclared tolerances. Before pass, the same commit/dirty/import/tool hashes are checked again. Per-rank JSONL records actual match caps/L, fresh COW source/destination, frees, request membership, component locks, pool counts, ordered collective calls, fault receipts and native publication/event barriers. Full successful samples require exactly aux+last_hidden+IDs/mask, exact N/width/BF16/int64, finite floats and exact per-request IDs/masks; no zero fill or truncation exists.
 
 Golden features use actual forced-full prefill under the same configured target/backend, not an official-only baseline. C retains ownership of the independent official-off/on numeric/loss/gradient oracle. Byte counters, exact remote sample-key absence, active attempts/readers and producer/consumer intents/fences are checked after explicit drain; a READY cache and an accounted idle pinned arena may remain. If writer or receive drain is unknown, the run fails and preserves `unresolved-ownership.json` including fences and lost-begin intent. No timeout, shutdown or missing response is relabeled as successful cleanup. Only the Process created by this launcher is eligible for forced teardown.
+
+## Dedicated natural same-content fill overlap (A3B TP2)
+
+Select `kinds: ["same_content_fill_overlap"]` in a fresh dedicated run, with
+`spec_feature_chunk_tokens: 256`, `spec_feature_cache_bytes: 67108864`, unchanged
+`max_running_requests: 1`, the normal single capture worker, and optional
+`fill_gate_timeout_s` in [5,45] (default45). All normal model/FA3/BF16/deterministic,
+FULL+MAMBA, fixed-source and root-allocation requirements above remain mandatory.
+This scenario runs before the shared golden/warmup: forced-full reference capture
+also populates HS, so prewarming the same key invalidates this fixture.
+
+Its pair arm uses `kind=same_content_fill_overlap` and an `actors` mapping with
+exact A/B `rid` and `sample_id`; both have identical native extension-1280 tokens,
+independent actual attempts, and separate physical sample keys. A normal fill is
+held only after its real pageable CPU aux copy, while the first chunk is WRITING
+and last_hidden is still unpublished. B must actually admit/forward on both TP
+ranks after A releases its effective engine slot, then submit its real full-range
+CUDA snapshot to the existing one-worker controller. The submit wrapper records
+queued/charged ownership and queries the genuine producer event, then releases A
+in finally before pending-batches=2 can block later owner commands. No extra
+reserve call, writer, worker, tensor result or collective is synthesized.
+
+The normal A publisher commits all five complete chunks once; the normal B fill
+subsequently observes READY and skips all five keys. The offline scalar oracle
+requires the exact natural partial order and per-key owner/reservation receipts,
+not just two pending HTTP requests or the global fill_skips counter. If B cannot
+naturally reach snapshot before A's bounded gate expires, coverage fails and the
+serialization boundary is retained; engine concurrency is never increased.
+
+A/B complete samples are compared to actual forced-full G captured after the
+pair using the unchanged predeclared tolerances; full hashes/difference counts
+are saved. A later ordinary R must use positive actual L and match G, exercising
+complete READY prefix assembly. Original per-request IDs/masks, all four distinct
+sample references, exact key absence, server/store reader/fence/intent drain,
+cache leases/WRITING/fills and controller private buffers are checked. Accounted
+READY cache and idle pinned arena may remain. Existing outer fault supervision
+and unresolved-ownership semantics apply on failure.
+
+CPU-only tests (no service/port/GPU):
+
+```bash
+CUDA_VISIBLE_DEVICES= TMPDIR=/workdir/spectrain/temp PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH=ROOT_SF/scripts/plana:ROOT_SF:ROOT_SG/python \
+/workdir/spectrain/training-envs/venvs/specforge-main-py312-cu129-sglang0518/bin/python \
+-m unittest discover -s tests/plana -p test_concurrent_fill_oracle.py -v
+```
+
+The new test module covers receipt negative controls and actual CPU cache-copy
+barrier mechanics only. A passing CPU suite is not actual A3B GPU acceptance.
