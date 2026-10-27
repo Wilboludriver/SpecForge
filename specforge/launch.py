@@ -1567,6 +1567,8 @@ def build_disagg_online_consumer(
     async_ack: Optional[bool] = None,
     consumer_dispatch: str = "cost_balanced",
     dispatch_num_anchors: int = 512,
+    ref_poll_s: float = 0.1,
+    distributor_poll_s: float = 0.05,
 ):
     """Consumer (trainer) side of an ONLINE disaggregated run.
 
@@ -1744,6 +1746,7 @@ def build_disagg_online_consumer(
                 skip_ids=skip_ids,
                 requeued_ids=requeued_ids,
                 idle_timeout_s=idle_timeout_s,
+                poll_s=distributor_poll_s,
             )
             inbox_server_url = os.environ.get("DISAGG_INBOX_SERVER_URL")
             if inbox_server_url:
@@ -1801,7 +1804,7 @@ def build_disagg_online_consumer(
         inbox = RemoteInboxChannel(inbox_server_url, dp_rank)
     else:
         inbox = InboxChannel(RefDistributor.inbox_path(inbox_dir, dp_rank))
-    queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s)
+    queue = StreamingRefQueue(inbox, idle_timeout_s=idle_timeout_s, poll_s=ref_poll_s)
 
     drain_state = {"attempted": False}
     fit_failure = {"error": None}
