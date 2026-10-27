@@ -49,6 +49,11 @@ class BridgeContracts(unittest.TestCase):
         value.registry=AttemptRegistry(value.epoch,capacity=2);value.jobs={};value.batches=[];value.history=deque(maxlen=8)
         value.cache=None;value.controller=None
         return value
+    def retire(self,bridge,wire,owner='independent-cleanup-owner'):
+        permit=bridge.control({**wire,'action':'cleanup_acquire','cleanup_owner':owner})
+        token=permit.get('cleanup_token')
+        self.assertTrue(token)
+        return bridge.control({**wire,'action':'cleanup_done','cleanup_token':token}),token
     def body(self,attempt='a',sample='same-g1'):
         tokens=(1,2,3,4)
         spec={'features':{'aux':'hidden_states','last_hidden':'target_last_hidden_states'},'passthrough':[]}
@@ -71,17 +76,17 @@ class BridgeContracts(unittest.TestCase):
         # Writer completion alone does not authorize replacement: producer's
         # remove/drain and explicit cleanup_done have not occurred yet.
         with self.assertRaises(ValueError):bridge.control(self.body(attempt='b'))
-        retired=bridge.control({**wire,'action':'cleanup_done'});self.assertEqual(retired['state'],'RETIRED')
+        retired,cleanup_token=self.retire(bridge,wire);self.assertEqual(retired['state'],'RETIRED')
         replacement=bridge.control(self.body(attempt='b'))
         self.assertNotEqual(replacement['reservation_token'],wire['reservation_token'])
         # Replayed old cleanup must not retire the new same-g1 reservation.
-        bridge.control({**wire,'action':'cleanup_done'})
+        bridge.control({**wire,'action':'cleanup_done','cleanup_token':cleanup_token})
         self.assertEqual(bridge.registry.lookup(replacement).attempt_id,'b')
 
     def test_retired_token_delayed_generate_is_rejected_and_registry_bounded(self):
         bridge=self.bridge();body=self.body();old=bridge.control(body);entry=bridge.registry.lookup(old)
         with self.assertRaises(ValueError):bridge.registry.claim({**body,**old,'reservation_token':'unknown'},(1,2,3,4))
-        entry.state='PUBLISHED';bridge.control({**old,'action':'cleanup_done'})
+        entry.state='PUBLISHED';self.retire(bridge,old)
         fresh=bridge.control(self.body(attempt='b'))
         with self.assertRaises(ValueError):bridge.registry.claim({**body,**old},(1,2,3,4))
         self.assertNotEqual(old['reservation_token'],fresh['reservation_token'])
