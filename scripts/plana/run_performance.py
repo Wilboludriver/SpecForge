@@ -10,12 +10,14 @@ from __future__ import annotations
 import argparse
 import atexit
 from collections import deque
+from contextlib import contextmanager
 import dataclasses
 import functools
 import hashlib
 import importlib
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -28,7 +30,8 @@ import traceback
 from performance_helpers import (GROUPS, WORKLOADS, OFFICIAL_PATCH_SHA256, ProcessSampler,
     aggregate_capture, aggregate_training, append_json, build_workload, canonical_digest,
     comparison_contract, compare_runs, content_fingerprint, isolate_config, load_rows, rewrite_capture_argv,
-    rewrite_worker_argv, validate_rdma_proof, write_json, optimizer_step_number)
+    rewrite_worker_argv, validate_rdma_proof, write_json, optimizer_step_number,
+    serialize_for_epoch_order, audit_consumed_order)
 
 OFFICIAL_SF = '716b02d7bf886cf5761685c0e57de887814ff15f'
 OFFICIAL_SG = '74be0a60ebfcc7d8e261096bca445ac51e383f03'
@@ -442,6 +445,63 @@ def warm_server(run_dir, cfg, resolved, server, workload):
         store.close()
 
 
+def _cleanup_probe_resources(sink, store, handle, sid, names, *, writer_finished=False,
+                             read_started=False, read_finished=False, report_path=None, store_id=None):
+    """Remove probe keys only after proven writer/reader drain; always close clients."""
+    errors=[]
+    def attempt(label,operation):
+        try:
+            operation()
+            return True
+        except BaseException as exc:
+            errors.append(f'{label}: {type(exc).__name__}: {exc}')
+            return False
+    writer_safe=sink is None
+    if sink is not None:
+        executor_drained=attempt('sink drain',lambda:sink._executor.shutdown(wait=True))
+        raw=getattr(sink,'_store',None)
+        close=getattr(raw,'close',None)
+        def close_transport():
+            rc=close()
+            if rc is not None and int(rc)!=0:
+                raise RuntimeError(f'native writer transport close failed ({rc})')
+        transport_stopped=attempt('sink transport close',close_transport) if close is not None else False
+        writer_safe=executor_drained and (writer_finished or transport_stopped or raw is None)
+    reader_safe=not read_started or read_finished
+    if store is not None:
+        # A failed native get may still own DMA receive storage with no returned handle.
+        # Closing its owned transport preserves the store's quarantine protocol; no
+        # removal RPC is issued through an uncertain receiver or before writer drain.
+        if writer_safe and reader_safe:
+            released=handle is None or attempt('read release',lambda:store.release(handle))
+            if released:
+                attempt('sample removal drain',lambda:store.drain_sample_removals([sid]))
+                for name in names:
+                    def remove(name=name):
+                        key=store._tkey(sid,1,name)
+                        if not store._store_remove(key) or store._store_exists(key):
+                            raise RuntimeError(f'probe key not removed: {key}')
+                    attempt('probe key cleanup',remove)
+        else:
+            errors.append('probe keys retained: writer/receiver drain unproven; owned transport/process teardown required')
+        health=getattr(store,'health',None)
+        before_close=None
+        if health is not None:
+            try:before_close=health()
+            except BaseException as exc:errors.append(f'health snapshot: {type(exc).__name__}: {exc}')
+        attempt('store close',store.close)
+    else:
+        before_close=None
+    if store_id is None:store_id=getattr(store,'store_id',None)
+    report={'store_id':store_id,'sample_id':sid,'generation':1,'feature_names':list(names),
+            'physical_keys':[f'{store_id}/{sid}/g1/{name}' for name in names] if store_id is not None else None,
+            'writer_safe':writer_safe,'reader_safe':reader_safe,
+            'key_removal_authorized':writer_safe and reader_safe,'health_before_close':before_close,'errors':errors}
+    if report_path is not None:
+        attempt('cleanup report',lambda:write_json(report_path,report))
+    if errors:raise RuntimeError('; '.join(errors))
+
+
 def rdma_cuda_probe(env, output):
     """Actual CUDA-pointer registration/publication/fetch/removal proof."""
     import torch
@@ -454,48 +514,106 @@ def rdma_cuda_probe(env, output):
     aux=torch.arange(128,device='cuda',dtype=torch.float32).reshape(32,4).to(torch.bfloat16)
     hidden=aux[:,:2].contiguous()
     cuda_ptrs={aux.untyped_storage().data_ptr(),hidden.untyped_storage().data_ptr()}
-    sink=SpecCaptureSink(aux_layer_ids=[0]);raw=sink._connect();registrations=[];puts=[];registration_failed=[False]
-    class Proxy:
-        def __getattr__(self,name):return getattr(raw,name)
-        def register_buffer(self,ptr,size):
-            try:
-                rc=raw.register_buffer(ptr,size)
-            except Exception:
-                if ptr in cuda_ptrs:registration_failed[0]=True
-                raise
-            if ptr in cuda_ptrs:
-                registrations.append(0 if rc is None else int(rc))
-                registration_failed[0] = registration_failed[0] or (rc is not None and int(rc)!=0)
-            return rc
-        def batch_put_from(self,*args):
-            result=raw.batch_put_from(*args);puts.extend([0]*len(args[0]) if result is None else result);return result
-    sink._store=Proxy()
     sid='cuda-proof-'+str(os.getpid());store_id='plana-proof-'+str(os.getpid())
+    names=('hidden_states','target_last_hidden_states')
+    sink=store=handle=None
+    writer_finished=read_started=read_finished=False
     try:
-        result=sink.put_samples([({'store_id':store_id,'sample_id':sid,'gen':1,'features':{'aux':'hidden_states','last_hidden':'target_last_hidden_states'}},aux,hidden)])[0]
-    except Exception as exc:
-        if registration_failed[0] or any(value is not None and int(value)<0 for value in puts):
-            raise DevicePublicationUnavailable('actual CUDA registration/RDMA transfer failed: '+str(exc)) from None
-        raise
-    store=MooncakeFeatureStore(store_id=store_id,setup_kwargs=_setup_from_env(env))
-    ref=SampleRef(sample_id=sid,run_id=store_id,source_task_id='proof',feature_store_uri=f'mooncake://{store_id}/{sid}',
-        feature_keys={name:f'{sid}/{name}' for name in result['features']},
-        feature_specs={name:FeatureSpec(name,tuple(meta['shape']),meta['dtype']) for name,meta in result['features'].items()},
-        strategy='dflash',num_tokens=32,metadata={'generation':1})
-    store.adopt(ref);features,handle=store.get(ref)
-    equal=torch.equal(features['hidden_states'],aux.cpu().unsqueeze(0)) and torch.equal(features['target_last_hidden_states'],hidden.cpu().unsqueeze(0))
-    store.release(handle);store.drain_sample_removals([sid])
-    removed=all(not store._store_exists(store._tkey(sid,1,name)) for name in result['features'])
-    proof={'protocol':'rdma','gpu_put':True,'cuda_source':aux.is_cuda and hidden.is_cuda,
-        'cuda_register_status':0 if len(registrations)==2 and all(value==0 for value in registrations) else -1,
-        'put_status':0 if puts and all(value is None or int(value)==0 for value in puts) else -1,
-        'fetch_equal':equal,'keys_removed':removed,'rdma_devices':env['MOONCAKE_RDMA_DEVICES'],
-        'local_memcpy_setting':os.environ.get('MC_STORE_MEMCPY'),
-        'forbidden_overrides':{key:os.environ[key] for key in ('MC_FORCE_TCP','MC_MS_AUTO_DISC','MC_USE_TENT','MC_USE_TEV1') if key in os.environ},
-        'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-        'cuda_device':torch.cuda.get_device_name(),'peermem_present':Path('/sys/module/nvidia_peermem').exists()}
-    write_json(output,proof);validate_rdma_proof(proof,expected_devices=env['MOONCAKE_RDMA_DEVICES'])
-    store.close();sink._executor.shutdown(wait=True)
+        # Connect the cleanup client before any write can create a partial sample.
+        store=MooncakeFeatureStore(store_id=store_id,setup_kwargs=_setup_from_env(env))
+        sink=SpecCaptureSink(aux_layer_ids=[0]);raw=sink._connect();registrations=[];puts=[];registration_failed=[False]
+        class Proxy:
+            def __getattr__(self,name):return getattr(raw,name)
+            def register_buffer(self,ptr,size):
+                try:
+                    rc=raw.register_buffer(ptr,size)
+                except Exception:
+                    if ptr in cuda_ptrs:registration_failed[0]=True
+                    raise
+                if ptr in cuda_ptrs:
+                    registrations.append(0 if rc is None else int(rc))
+                    registration_failed[0] = registration_failed[0] or (rc is not None and int(rc)!=0)
+                return rc
+            def batch_put_from(self,*args):
+                result=raw.batch_put_from(*args);puts.extend([0]*len(args[0]) if result is None else result);return result
+        sink._store=Proxy()
+        try:
+            result=sink.put_samples([({'store_id':store_id,'sample_id':sid,'gen':1,'features':{'aux':names[0],'last_hidden':names[1]}},aux,hidden)])[0]
+            writer_finished=True
+        except Exception as exc:
+            if registration_failed[0] or any(value is not None and int(value)<0 for value in puts):
+                raise DevicePublicationUnavailable('actual CUDA registration/RDMA transfer failed: '+str(exc)) from None
+            raise
+        ref=SampleRef(sample_id=sid,run_id=store_id,source_task_id='proof',feature_store_uri=f'mooncake://{store_id}/{sid}',
+            feature_keys={name:f'{sid}/{name}' for name in result['features']},
+            feature_specs={name:FeatureSpec(name,tuple(meta['shape']),meta['dtype']) for name,meta in result['features'].items()},
+            strategy='dflash',num_tokens=32,metadata={'generation':1})
+        store.adopt(ref)
+        read_started=True
+        features,handle=store.get(ref)
+        read_finished=True
+        equal=torch.equal(features[names[0]],aux.cpu().unsqueeze(0)) and torch.equal(features[names[1]],hidden.cpu().unsqueeze(0))
+        store.release(handle);handle=None;store.drain_sample_removals([sid])
+        removed=all(not store._store_exists(store._tkey(sid,1,name)) for name in names)
+        proof={'protocol':'rdma','gpu_put':True,'cuda_source':aux.is_cuda and hidden.is_cuda,
+            'cuda_register_status':0 if len(registrations)==2 and all(value==0 for value in registrations) else -1,
+            'put_status':0 if puts and all(value is None or int(value)==0 for value in puts) else -1,
+            'fetch_equal':equal,'keys_removed':removed,'rdma_devices':env['MOONCAKE_RDMA_DEVICES'],
+            'local_memcpy_setting':os.environ.get('MC_STORE_MEMCPY'),
+            'forbidden_overrides':{key:os.environ[key] for key in ('MC_FORCE_TCP','MC_MS_AUTO_DISC','MC_USE_TENT','MC_USE_TEV1') if key in os.environ},
+            'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'cuda_device':torch.cuda.get_device_name(),'peermem_present':Path('/sys/module/nvidia_peermem').exists()}
+        write_json(output,proof);validate_rdma_proof(proof,expected_devices=env['MOONCAKE_RDMA_DEVICES'])
+    finally:
+        _cleanup_probe_resources(sink,store,handle,sid,names,writer_finished=writer_finished,
+            read_started=read_started,read_finished=read_finished,report_path=Path(output).with_name('probe-cleanup.json'),store_id=store_id)
+
+
+@contextmanager
+def scoped_environment(values):
+    previous={key:os.environ.get(key) for key in values}
+    try:
+        os.environ.update(values)
+        yield
+    finally:
+        for key,value in previous.items():
+            if value is None:os.environ.pop(key,None)
+            else:os.environ[key]=value
+
+
+def run_owned_probe(popen, argv, *, env, terminate, timeout_s, grace_s):
+    """A probe is a detached, bounded child and is drained on every exit path."""
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError('positive native probe timeout required')
+    probe=popen(argv,env=env,start_new_session=True)
+    if probe.pid == os.getpid() or probe.pid <= 0:
+        raise RuntimeError('probe must be a distinct owned child session')
+    try:
+        return probe.wait(timeout=timeout_s)
+    finally:
+        terminate([probe],grace_s=grace_s,
+                  exited_group_leaders=[probe] if probe.poll() is not None else [])
+
+
+def finish_owned_run(launch_module, real_stop, started_services, processes, sampler, run_dir, *, grace_s):
+    """Attempt every cleanup phase even if an earlier phase raises/interruption repeats."""
+    errors=[]
+    def attempt(label, operation):
+        try:return operation()
+        except BaseException as exc:errors.append(f'{label}: {type(exc).__name__}: {exc}')
+    attempt('services',lambda:real_stop(started_services,grace_s=grace_s))
+    # Every spawn wrapper enforces start_new_session=True; the orchestrator is never tracked here.
+    def drain_children():
+        live=[process for process in processes if process.pid != os.getpid() and process.poll() is None]
+        launch_module._terminate_processes(live,grace_s=grace_s)
+    attempt('owned children',drain_children)
+    sampler_status=attempt('sampler',sampler.stop)
+    attempt('exit records',lambda:write_json(Path(run_dir)/'owned-processes-final.json',
+        [{'pid':p.pid,'exit':p.poll()} for p in processes]))
+    if errors:raise RuntimeError('owned run cleanup failed: '+'; '.join(errors))
+    if any(process.poll() is None for process in processes):
+        raise RuntimeError('owned child remained live after cleanup')
+    return sampler_status
 
 
 def final_server_and_keys(plan, run_dir):
@@ -527,25 +645,29 @@ def final_server_and_keys(plan, run_dir):
                 if value>limit:raise AssertionError('actual cache/controller hard budget exceeded')
     store=MooncakeFeatureStore(store_id='plana-final-inspection',setup_kwargs=_setup_from_env(server.command.env))
     remaining=[];key_count=0
-    for row in _load_events(run_dir,'captures'):
-        ref=row['ref'];store_id=ref['feature_store_uri'].split('://',1)[1].split('/',1)[0]
-        for name in ref['feature_specs']:
-            key=f"{store_id}/{ref['sample_id']}/g1/{name}";key_count+=1
-            if store._store_exists(key):remaining.append(key)
-    store.close();final.update(inspected_keys=key_count,remaining_keys=remaining)
+    try:
+        for row in _load_events(run_dir,'captures'):
+            ref=row['ref'];store_id=ref['feature_store_uri'].split('://',1)[1].split('/',1)[0]
+            for name in ref['feature_specs']:
+                key=f"{store_id}/{ref['sample_id']}/g1/{name}";key_count+=1
+                if store._store_exists(key):remaining.append(key)
+    finally:
+        store.close()
+    final.update(inspected_keys=key_count,remaining_keys=remaining)
     write_json(Path(run_dir)/'cleanup-final.json',final)
     if remaining:raise AssertionError('actual training left published sample keys')
 
 
 def summarize(run_dir, workload, group):
     consumed=_load_events(run_dir,'consumed');steps=_load_events(run_dir,'training-steps')
+    consumed_order=audit_consumed_order(consumed,_load_events(run_dir,'fetch-validation'),workload)
     warmup=workload['training_warmup_steps'];end=warmup+workload['measured_steps']
     used={sid for row in consumed if row['optimizer_stepped'] and warmup<row['step']<=end for sid in row['sample_ids']}
     captures=[row for row in _load_events(run_dir,'captures') if row['sample_id'] in used]
     if len(used)!=workload['measured_steps'] or len(captures)!=len(used):raise AssertionError('measured optimizer samples lack complete unique capture diagnostics')
     fits=_load_events(run_dir,'fit')
     if len(fits)!=1:raise AssertionError('exactly one actual training rank fit record required')
-    result={'training':aggregate_training(steps,warmup_steps=warmup,measured_steps=workload['measured_steps']),
+    result={'consumed_order':consumed_order,'training':aggregate_training(steps,warmup_steps=warmup,measured_steps=workload['measured_steps']),
             'capture':aggregate_capture(captures),'actual_fit':fits[0],
             'initial_draft':_load_events(run_dir,'draft-initial'),
             'validation_wall_s':sum(row['validation_wall_s'] for row in _load_events(run_dir,'fetch-validation') if row['sample_id'] in used),
@@ -579,18 +701,45 @@ def summarize(run_dir, workload, group):
 
 
 def _load_resource_samples(path,window=None):
-    rows=[json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows=[json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
     if window is not None:
         rows=[row for row in rows if window[0]<=row.get('monotonic',-1)<=window[1]]
-    return {'host_pss_peak_bytes':max((sum(p['pss_bytes'] or 0 for p in row['host']) for row in rows),default=None),
-        'host_rss_sum_peak_bytes':max((sum(p['rss_bytes'] or 0 for p in row['host']) for row in rows),default=None),
-        'host_locked_sum_peak_bytes':max((sum(p['locked_bytes'] or 0 for p in row['host']) for row in rows),default=None),
-        'gpu_physical_used_sum_peak_bytes':max((sum(p['physical_used_bytes'] for p in row['gpu']) for row in rows if row['gpu']),default=None),
-        'sample_count':len(rows),'gpu_samples_with_values':sum(bool(row['gpu']) for row in rows),
-        'host_pss_complete_samples':sum(bool(row['host']) and all(p['pss_bytes'] is not None for p in row['host']) for row in rows),
+    peaks,coverage={},{}
+    for field,key in (('pss_bytes','host_pss_peak_bytes'),('rss_bytes','host_rss_sum_peak_bytes'),
+                      ('locked_bytes','host_locked_sum_peak_bytes')):
+        complete,partial,unavailable=[],[],0
+        for row in rows:
+            host=row['host'];expected=row.get('owned_process_count',len(host))
+            values=[p[field] for p in host if isinstance(p.get(field),(int,float)) and p[field]>=0]
+            if expected and len(host)==expected and len(values)==expected and row.get('owned_tree_complete',True):
+                complete.append(sum(values))
+            elif values:
+                partial.append(sum(values))
+            else:
+                unavailable+=1
+        peaks[key]=max(complete,default=None)
+        coverage[field]={'complete_samples':len(complete),'partial_samples':len(partial),
+            'unavailable_samples':unavailable,'complete_fraction':len(complete)/len(rows) if rows else 0.,
+            'partial_known_sum_peak_bytes':max(partial,default=None)}
+    gpu_values=[sum(p['physical_used_bytes'] for p in row['gpu']) for row in rows
+        if row['gpu'] and row.get('gpu_query_complete',False) and row.get('owned_tree_complete',True)]
+    gpu_partial=[sum(p['physical_used_bytes'] for p in row['gpu']) for row in rows
+        if row['gpu'] and not (row.get('gpu_query_complete',False) and row.get('owned_tree_complete',True))]
+    gpu_complete=sum(row.get('gpu_query_complete',False) and row.get('owned_tree_complete',True) for row in rows)
+    errors=[error for row in rows for error in row.get('errors',[])]
+    intervals=[b['monotonic']-a['monotonic'] for a,b in zip(rows,rows[1:])]
+    return {**peaks,'host_metric_coverage':coverage,
+        'gpu_physical_used_sum_peak_bytes':max(gpu_values,default=None),
+        'sample_count':len(rows),'gpu_samples_with_values':len(gpu_values)+len(gpu_partial),'gpu_complete_samples_with_values':len(gpu_values),
+        'gpu_partial_known_sum_peak_bytes':max(gpu_partial,default=None),'gpu_query_complete_samples':gpu_complete,
+        'host_pss_complete_samples':coverage['pss_bytes']['complete_samples'],
+        'host_memory_comparison_eligible':len(rows)>=2 and all(item['complete_samples']==len(rows) for item in coverage.values()) and not errors,
+        'gpu_memory_comparison_eligible':len(rows)>=2 and len(gpu_values)==len(rows) and gpu_complete==len(rows) and not errors,
+        'errors':errors,'fatal_sampler_errors':sum(bool(row.get('fatal_sampler_error')) for row in rows),
         'sampling_interval_s':rows[0]['sample_interval_s'] if rows else None,
+        'observed_interval_s':{'min':min(intervals,default=None),'max':max(intervals,default=None)},
         'window_monotonic':window,
-        'boundary':'owned process trees, sampled observed simultaneous peaks; torch allocated/reserved separately in fit event'}
+        'boundary':'complete simultaneous host observations only; partial known sums and missing coverage separate; sampled bounds, not exact peaks'}
 
 
 def instrumented_child(kind, original):
@@ -631,11 +780,14 @@ def main(argv=None):
     parser.add_argument('--expected-specforge',required=True);parser.add_argument('--expected-sglang',required=True)
     parser.add_argument('--warmup-steps',type=int,default=8);parser.add_argument('--steps',type=int,default=64)
     parser.add_argument('--cache-bytes',type=int,default=64<<20);parser.add_argument('--chunk-tokens',type=int,default=256)
+    parser.add_argument('--rdma-probe-timeout-s',type=float,default=120.,help='bounded native CUDA/RDMA probe wait')
     parser.add_argument('--execute',action='store_true',help='requires root-assigned GPUs/ports/HCAs; default only plans')
     args=parser.parse_args(raw)
     run_dir=Path(args.run_dir).resolve();run_dir.mkdir(parents=True,exist_ok=False)
     result={'status':'planning','passed':False,'group':args.group,'workload':args.workload,'transport':args.transport}
     try:
+        if not math.isfinite(args.rdma_probe_timeout_s) or args.rdma_probe_timeout_s <= 0:
+            raise ValueError('positive finite RDMA probe timeout required')
         sf=git_identity(args.specforge_source,args.expected_specforge);sg=git_identity(args.sglang_source,args.expected_sglang)
         if args.group in ('host-off','device-off') and (sf['commit']!=OFFICIAL_SF or sg['commit']!=OFFICIAL_SG):
             raise ValueError('official comparison groups require the exact immutable official baselines')
@@ -649,6 +801,8 @@ def main(argv=None):
         from specforge.config import load_config
         from specforge.application import resolve_run
         from specforge.launch_plan import build_launch_plan,run_commands,_wait_for_service
+        from specforge.launch import _epoch_prompt_indices
+        from specforge.training.disaggregated import _online_prompt_seed
         original=yaml.safe_load(Path(args.config).read_text());original_cfg=load_config(args.config);resolved=resolve_run(original_cfg)
         schema=_model_info(original_cfg,resolved)
         native,real=load_rows(args.native_cases),load_rows(args.real_cases)
@@ -656,13 +810,16 @@ def main(argv=None):
             chunk_tokens=args.chunk_tokens,row_bytes=schema['row_bytes'],cache_bytes=args.cache_bytes)
         if max(len(row['input_ids']) for row in workload['training'])>original_cfg.data.max_length:
             raise ValueError('workload would be silently truncated by native reader; refusing entire run')
-        workload['fingerprints']=sorted({content_fingerprint(row['input_ids'],row['loss_mask']) for row in workload['training']+workload['prewarm']})
-        write_json(run_dir/'workload.json',workload)
-        (run_dir/'training.jsonl').write_text(''.join(json.dumps({'input_ids':row['input_ids'],'loss_mask':row['loss_mask']})+'\n' for row in workload['training']))
         cfg_dict=isolate_config(original,run_dir=run_dir,workload=workload,group=args.group,transport=args.transport,
             cache_bytes=args.cache_bytes,chunk_tokens=args.chunk_tokens,rdma_devices=args.rdma_devices)
         config_path=run_dir/'config.yaml';config_path.write_text(yaml.safe_dump(cfg_dict,sort_keys=False))
         cfg=load_config(str(config_path));resolved=resolve_run(cfg)
+        if cfg.runtime.producer_concurrency != 1:
+            raise ValueError('resolved runtime producer_concurrency must be exactly one')
+        serialize_for_epoch_order(workload,_epoch_prompt_indices,prompt_seed=_online_prompt_seed(cfg))
+        workload['fingerprints']=sorted({content_fingerprint(row['input_ids'],row['loss_mask']) for row in workload['training']+workload['prewarm']})
+        write_json(run_dir/'workload.json',workload)
+        (run_dir/'training.jsonl').write_text(''.join(json.dumps({'input_ids':row['input_ids'],'loss_mask':row['loss_mask']})+'\n' for row in workload['training']))
         performance_env={'PYTHONPATH':os.pathsep.join([str(Path(args.specforge_source).resolve()),str(Path(args.sglang_source).resolve()/'python')]),
             'HF_HUB_OFFLINE':'1','TRANSFORMERS_OFFLINE':'1','PLANA_PERF_RUN_DIR':str(run_dir),
             'PLANA_PERF_SPECFORGE_SOURCE':str(Path(args.specforge_source).resolve()),
@@ -684,6 +841,8 @@ def main(argv=None):
             env={**performance_env,**command.env,'PLANA_PERF_ROLE':command.label}) for command in plan.commands)
         plan=dataclasses.replace(plan,commands=commands,services=tuple(services))
         write_json(run_dir/'manifest.json',{'comparison_contract': comparison_contract(cfg_dict,workload['data_sha256'],schema,args.cache_bytes,args.chunk_tokens), 'specforge':sf,'sglang':sg,'schema':schema,'data_sha256':workload['data_sha256'],
+            'intended_data_sha256':workload['intended_data_sha256'],'prompt_seed':workload['prompt_seed'],
+            'producer_concurrency':cfg.runtime.producer_concurrency,
             'template_sha256':hashlib.sha256(Path(args.config).read_bytes()).hexdigest(),'argv':raw,
             'python':sys.executable,'harness_sha256':hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
             'helpers_sha256':hashlib.sha256(SCRIPT.with_name('performance_helpers.py').read_bytes()).hexdigest(),
@@ -701,10 +860,14 @@ def main(argv=None):
         from types import SimpleNamespace
         sampler=ProcessSampler(run_dir/'resources.jsonl')
         sampler.add('orchestrator',SimpleNamespace(pid=os.getpid(),poll=lambda:None))
-        sampler.start()
         processes=[];warmed=False
+        parent_env={key:base_env[key] for key in ('PLANA_PERF_RUN_DIR','PLANA_PERF_WORKLOAD_JSON','PLANA_PERF_SCHEMA_JSON')}
+        if args.transport=='rdma':parent_env['MC_STORE_MEMCPY']='0'
         labels={tuple(command.argv):command.label for command in (*plan.commands,*(service.command for service in plan.services))}
         def popen(*a,**kw):
+            if kw.get('start_new_session',True) is not True:
+                raise ValueError('all owned performance children require detached sessions')
+            kw['start_new_session']=True
             process=subprocess.Popen(*a,**kw);processes.append(process)
             label=labels.get(tuple(a[0]),'rdma-proof' if '--rdma-probe' in a[0] else 'owned-extra')
             sampler.add(label,process)
@@ -716,15 +879,17 @@ def main(argv=None):
             if service.command.label.startswith('capture-server-') and not warmed:
                 if args.group=='device-off':
                     proof_env={**os.environ,**service.command.env,'CUDA_VISIBLE_DEVICES':service.command.env['CUDA_VISIBLE_DEVICES']}
-                    probe=popen([sys.executable,str(SCRIPT),'--rdma-probe',str(run_dir/'device-proof.json')],env=proof_env)
-                    probe_status=probe.wait()
+                    import specforge.launch_plan as launch_module
+                    probe_status=run_owned_probe(popen,[sys.executable,str(SCRIPT),'--rdma-probe',str(run_dir/'device-proof.json')],
+                        env=proof_env,terminate=launch_module._terminate_processes,
+                        timeout_s=args.rdma_probe_timeout_s,grace_s=plan.shutdown_grace_s)
                     if probe_status==3:raise DevicePublicationUnavailable('actual native CUDA registration/RDMA transfer unavailable; see device-proof.json')
                     if probe_status!=0:raise RuntimeError('device proof harness failed; see device-proof.json')
                     result['device_publication_available']=True
-                os.environ.update({key:base_env[key] for key in ('PLANA_PERF_RUN_DIR','PLANA_PERF_WORKLOAD_JSON','PLANA_PERF_SCHEMA_JSON')})
-                warm_server(run_dir,cfg,resolved,service,workload);warmed=True
+                with scoped_environment(parent_env):
+                    warm_server(run_dir,cfg,resolved,service,workload)
+                warmed=True
         # Defer service teardown until worker validation and final control/key audit.
-        def stop_later(*_args,**_kwargs):pass
         import specforge.launch_plan as launch_module
         real_stop=launch_module._stop_services
         started_services=[]
@@ -732,19 +897,20 @@ def main(argv=None):
         launch_module._stop_services=remember_stop
         started=time.perf_counter()
         try:
+            sampler.start()
             status=run_commands(plan,popen=popen,readiness_waiter=ready)
             result['command_exit']=status;result['whole_command_wall_s']=time.perf_counter()-started
             if status:raise RuntimeError(f'actual CLI workers failed exit={status}')
-            final_server_and_keys(plan,run_dir)
+            with scoped_environment(parent_env):
+                final_server_and_keys(plan,run_dir)
             result.update(summarize(run_dir,workload,args.group),passed=True,status='passed')
         finally:
             launch_module._stop_services=real_stop
-            if started_services:real_stop(started_services,grace_s=plan.shutdown_grace_s)
-            sampler.stop()
-            write_json(run_dir/'owned-processes-final.json',[{'pid':p.pid,'exit':p.poll()} for p in processes])
+            result['resource_sampler']=finish_owned_run(launch_module,real_stop,started_services,processes,sampler,run_dir,
+                grace_s=plan.shutdown_grace_s)
         return 0
     except BaseException as exc:
-        result.update(status='unavailable' if isinstance(exc,DevicePublicationUnavailable) else 'failed',error=f'{type(exc).__name__}: {exc}')
+        result.update(passed=False,status='unavailable' if isinstance(exc,DevicePublicationUnavailable) else 'failed',error=f'{type(exc).__name__}: {exc}')
         (run_dir/'failure.txt').write_text(traceback.format_exc());traceback.print_exc()
         return 2
     finally:
