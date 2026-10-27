@@ -1438,12 +1438,34 @@ class LaunchPlanTest(unittest.TestCase):
             ["--enable-metrics"],
         )
 
+    def test_feature_cache_switch_and_byte_budget_are_distinct_exact_flags(self):
+        for first, second in (
+            (["--spec-feature-cache"], ["--spec-feature-cache-bytes", "67108864"]),
+            (["--spec-feature-cache-bytes=67108864"], ["--spec-feature-cache"]),
+        ):
+            for placement in ("global", "server", "both"):
+                with self.subTest(first=first, placement=placement):
+                    raw = _managed_config("/fresh/feature-cache-flags").model_dump()
+                    server = raw["deployment"]["disaggregated"]["managed_local"]["capture_servers"][0]
+                    if placement == "global":
+                        raw["model"]["sglang_extra_args"] = first + second
+                    elif placement == "server":
+                        server["extra_args"] = first + second
+                    else:
+                        raw["model"]["sglang_extra_args"] = first
+                        server["extra_args"] = second
+                    plan = _build_managed(raw)
+                    command = next(s.command for s in plan.services if s.command.label.startswith("capture-server-"))
+                    for token in first + second:
+                        self.assertIn(token, command.argv)
+
     def test_passthrough_rejects_abbreviated_duplicates_in_either_order(self):
         # Include a passthrough-only option: this must not depend on whether
         # ModelConfig has a typed field for the full spelling.
         for full, short in (
             ("--max-prefill-tokens", "--max-prefill-token"),
             ("--prefill-max-requests", "--prefill-max-request"),
+            ("--spec-feature-cache-bytes", "--spec-feature-cach"),
         ):
             for first, second in ((full, short), (short, full)):
                 for placement in ("global", "server", "both"):

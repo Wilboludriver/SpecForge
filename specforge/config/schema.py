@@ -131,6 +131,7 @@ _SGLANG_EXACT_PREFIX_FLAGS = frozenset(
         "--model",
         "--quantization",
         "--sidecar",
+        "--spec-feature-cache",
         "--speculative-adaptive",
         "--speculative-draft-model",
         "--ssl-keyfile",
