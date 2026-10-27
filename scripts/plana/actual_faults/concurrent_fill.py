@@ -386,6 +386,9 @@ def run_case(client,directory,row):
         check_features(a,row,client.model,reference=g,**config['feature_tolerances'])
         check_features(b,row,client.model,reference=g,**config['feature_tolerances'])
         result['feature_comparisons']={'A_vs_G':_feature_report(a,g),'B_vs_G':_feature_report(b,g)}
+        # A/B prove cold overlap; only now establish a native legal checkpoint
+        # for the separate positive-L assembly check, keeping READY HS unchanged.
+        result['ordinary_kv_probes']=client.warm_ordinary_checkpoint(row,case_id+'-ready-reuse')
         r,rr=client.fetch(client.submit(case_id+'-R',row)[0],row,reference=g)
         diag=rr.metadata['capture_diagnostics']
         if not 0<diag['L']<=diag['H']:raise AssertionError('READY cache not exercised by actual positive-L assembly')
