@@ -15,7 +15,9 @@ class HybridC384OracleTests(unittest.TestCase):
         diagnostics = [{'H': h, 'L': l, 'N': len(row['input_ids']), 'span': [l, len(row['input_ids'])], 'reused_tokens': l}
                        for row, h, l in zip(cases, (0, 0, 384, 768, 768, 0, 0), (0, 0, 192, 448, 0, 0, 0), strict=True)]
         actions = {'engine_flush': {'status': 200, 'hs_cache_unchanged': True},
-                   'later_checkpoint_probe': {'cached_tokens': 960, 'has_spec_capture': False, 'hs_cache_unchanged': True},
+                   'later_checkpoint_probe': {'probes': [
+                       {'input_ids': cases[2]['input_ids'], 'cached_tokens': 256, 'has_spec_capture': False, 'hs_cache_unchanged': True},
+                       {'input_ids': cases[2]['input_ids'], 'cached_tokens': 448, 'has_spec_capture': False, 'hs_cache_unchanged': True}]},
                    'ordinary_uncaptured_kv': {'cached_tokens': 960, 'has_spec_capture': False, 'hs_cache_unchanged': True}}
         return cases, diagnostics, actions
 
@@ -36,7 +38,18 @@ class HybridC384OracleTests(unittest.TestCase):
             elif mode == 'no-KV': actions['ordinary_uncaptured_kv']['cached_tokens'] = 0
             elif mode == 'captured-KV': actions['ordinary_uncaptured_kv']['has_spec_capture'] = True
             elif mode == 'KV-changes-HS': actions['ordinary_uncaptured_kv']['hs_cache_unchanged'] = False
-            else: actions['later_checkpoint_probe']['cached_tokens'] = 384
+            else: actions['later_checkpoint_probe']['probes'][-1]['cached_tokens'] = 384
+            with self.subTest(mode=mode), self.assertRaises(AssertionError):
+                fixture.validate_outcome(cases, diagnostics, actions)
+
+    def test_later_checkpoint_must_be_legal_for_the_exact_bounded_request(self):
+        for mode in ('longer-request', 'N-minus1-violation', 'third-probe', 'first-probe-HS-mutation'):
+            cases, diagnostics, actions = self.evidence()
+            probes = actions['later_checkpoint_probe']['probes']
+            if mode == 'longer-request': probes[-1]['input_ids'] = [1] * 1024
+            elif mode == 'N-minus1-violation': probes[-1]['cached_tokens'] = 960
+            elif mode == 'third-probe': probes.append(dict(probes[-1]))
+            else: probes[0]['hs_cache_unchanged'] = False
             with self.subTest(mode=mode), self.assertRaises(AssertionError):
                 fixture.validate_outcome(cases, diagnostics, actions)
 
