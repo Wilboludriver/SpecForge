@@ -69,6 +69,9 @@ class RuntimeContracts(unittest.TestCase):
         self.assertIsNotNone(reservation)
         return controller.freeze_plan(execution,self.ns,self.tokens,11,L,lease,reservation)
     def zero_private(self,controller):
+        # Owner polling is part of the real lifecycle: consume both terminal
+        # queues before demanding that execution metadata has been reaped.
+        controller.poll_completed();controller.poll_drained()
         stats=controller.stats()
         for name in ('active_leases','fill_reservations','writing_blocks','pinned_bytes','output_bytes','device_bytes','pending_executions','pending_copies'):
             self.assertEqual(stats[name],0,(name,stats))
