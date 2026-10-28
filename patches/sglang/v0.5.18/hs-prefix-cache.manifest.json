@@ -5,15 +5,16 @@
   "official_capture_patch_sha256": "8182e4eac902b4009f4d0314c3b6a9e71543faeac5412e3032b8741ec35537a8",
   "official_only_commit": "74be0a60ebfcc7d8e261096bca445ac51e383f03",
   "delta_patch": "hs-prefix-cache.patch",
-  "delta_sha256": "1aec8f7bffe60b212de8fb5dfa2e0407cfbf29561f23565f19392d1c8e6bdddb",
-  "source_commit": "6e81950da2aae9e08a6ceced03d9be8a69a2a79c",
-  "source_tree": "69e86e277d7f8ccd8b24f98d4f00e6279d59d53b",
+  "delta_sha256": "abd9e9fcc630afb6baffb539202a8381b722917702143e169f7e7f70c61891d3",
+  "source_commit": "cebcedeb15f06315104fb33fd9d35b1cf0342d13",
+  "source_tree": "dc9e7b94553e36ffc6ffb17778341a9b6f66f18d",
   "apply_order": [
     "fixed upstream",
     "unchanged official capture patch",
     "this HS delta"
   ],
-  "scope": "single server complete-sample CPU raw hidden-state prefix reuse; deterministic CUDA BF16 FA3; selected hybrid Triton FP32 recurrent pool; no generation/offload/distributed cache",
-  "validation_evidence": "implementation/validation/replay-6e81950.json in the containing project",
-  "performance": "not established by patch replay or numerical correctness"
+  "scope": "single server complete-sample CPU raw hidden-state prefix reuse; deterministic CUDA BF16 FA3; selected hybrid Triton FP32 recurrent pool; no generation/offload/distributed cache; Phase1 negotiated immutable attempt-v1 publication transfer, batched reservation/publication, bounded parallel CPU assembly, full-storage release-time cache adoption",
+  "validation_evidence": "implementation/real1632-perf-fix-20261028/delivery/replay-packaged-cebcede.json in the containing project",
+  "performance": "See implementation/real1632-perf-fix-20261028/delivery/REPORT.txt for actual real1632 steps11-30 results and limitations; replay alone is not performance evidence.",
+  "companion_specforge_production_commit": "07e52b51ae2dda82b70fbd80a4f6ccd2a16252d4"
 }

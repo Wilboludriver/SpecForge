@@ -650,7 +650,7 @@ index 8212d4e..fbe8c8f 100644
              if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                  self._pending_chunked_abort_req = chunked_req
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 31defd0..86dab56 100644
+index 31defd0..e06af76 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -71,6 +71,7 @@ if TYPE_CHECKING:
@@ -714,7 +714,17 @@ index 31defd0..86dab56 100644
                  return_logprob,
                  time.perf_counter(),
              )
-@@ -647,19 +663,28 @@ class SchedulerBatchResultProcessor:
+@@ -643,23 +659,37 @@ class SchedulerBatchResultProcessor:
+         )
+         if max_pending < 1:
+             raise ValueError("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES must be >= 1")
+-        if len(self._spec_capture_batches) >= max_pending:
++        # Controller reservations already charge every retained output, pinned
++        # and device allocation. A fixed count would stall that bounded pipeline.
++        # Official/host-off captures have no such reservation and retain the
++        # existing finite bound, including mixed pipelines.
++        budgeted = bool(negotiated) and all(getattr(item[0], "spec_feature_plan", None) is not None for item in pending)
++        if not budgeted and len(self._spec_capture_batches) >= max_pending:
              self.drain_spec_captures(block=True, max_batches=1)
  
      def has_pending_spec_captures(self) -> bool:
@@ -746,7 +756,7 @@ index 31defd0..86dab56 100644
              self._spec_capture_batches.pop(0)
              self._complete_spec_capture_batch(
                  pending,
-@@ -681,6 +706,9 @@ class SchedulerBatchResultProcessor:
+@@ -681,6 +711,9 @@ class SchedulerBatchResultProcessor:
                      f"{len(pending)} samples"
                  )
          except Exception as e:
@@ -906,12 +916,163 @@ index c40bcc6..117c71f 100644
      def _run_resolution_pipeline(self):
          """
          Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
+diff --git a/python/sglang/srt/spec_capture_sink.py b/python/sglang/srt/spec_capture_sink.py
+index 2deff06..bb77dfa 100644
+--- a/python/sglang/srt/spec_capture_sink.py
++++ b/python/sglang/srt/spec_capture_sink.py
+@@ -354,6 +354,11 @@ class CaptureArena:
+         self._spans.insert(index, (offset, size))
+ 
+ 
++class CaptureWriterUncertain(RuntimeError):
++    """The native writer did not prove its source-buffer drain."""
++    capture_writer_drained = False
++
++
+ class SpecCaptureSink:
+     """Writes captured per-request tensors into Mooncake in SpecForge layout."""
+ 
+@@ -364,6 +369,7 @@ class SpecCaptureSink:
+         self._capture_arena: Optional[CaptureArena] = None
+         self._control_listener: Optional[socket.socket] = None
+         self._lock = threading.Lock()
++        self._uncertain_publications = []
+         # One store writer is sufficient: Mooncake already stripes a batched
+         # transfer internally.  The executor decouples that host transfer from
+         # the scheduler so the next target prefill can run concurrently.
+@@ -487,9 +493,15 @@ class SpecCaptureSink:
+         return self._executor.submit(self._put_ready_samples, samples, ready)
+ 
+     def _put_ready_samples(self, samples, ready):
+-        for event in ready:
+-            event.synchronize()
+-        return self.put_samples(samples)
++        try:
++            for event in ready:
++                event.synchronize()
++            return self.put_samples(samples)
++        finally:
++            # Executor completion must not leave source tensors in WorkItem args
++            # while the scheduler transfers their output reservation to cache.
++            samples.clear()
++            ready.clear()
+ 
+     def put_samples(
+         self,
+@@ -510,6 +522,8 @@ class SpecCaptureSink:
+         """
+         if not samples:
+             return []
++        if self._uncertain_publications:
++            raise RuntimeError("spec-capture native writer quarantined; further publication disabled")
+ 
+         store = None if arena_enabled() else self._connect()
+         timing_enabled = os.environ.get("SGLANG_SPEC_CAPTURE_TIMING", "0") == "1"
+@@ -537,10 +551,12 @@ class SpecCaptureSink:
+             else:
+                 tensor = tensor.detach().to("cpu").contiguous()
+             key = self._tkey(store_id, sample_id, gen, name)
++            if spec.get("object_key_layout") == "attempt-v1":
++                key = f"{store_id}/{sample_id}/g{gen}/attempt/{spec['server_epoch']}/{spec['reservation_token']}/{name}"
+             keys.append(key)
+             tensors.append(tensor)
+             sizes.append(tensor.element_size() * tensor.numel())
+-            if replace:
++            if replace and spec.get("object_key_layout") != "attempt-v1":
+                 replace_keys.append(key)
+             result_feats[name] = {
+                 "shape": list(tensor.shape),
+@@ -548,6 +564,8 @@ class SpecCaptureSink:
+                     tensor.dtype, str(tensor.dtype).replace("torch.", "")
+                 ),
+             }
++            if spec.get("object_key_layout") == "attempt-v1":
++                result_feats[name]["key"] = key
+             feature_meta.append(result_feats[name])
+ 
+         for spec, aux, last_hidden in samples:
+@@ -632,6 +650,7 @@ class SpecCaptureSink:
+         registered: List[int] = []
+         seen_storage = set()
+         register_started = time.perf_counter()
++        submitted = quarantined = False
+         try:
+             for tensor, nbytes in zip(tensors, sizes):
+                 storage = tensor.untyped_storage()
+@@ -661,6 +680,7 @@ class SpecCaptureSink:
+             register_ms = (time.perf_counter() - register_started) * 1000.0
+             put_started = time.perf_counter()
+             batch_put = getattr(store, "batch_put_from", None)
++            submitted = True
+             if batch_put is None:
+                 statuses = [
+                     store.put_from(key, tensor.data_ptr(), nbytes, self._put_config)
+@@ -674,35 +694,33 @@ class SpecCaptureSink:
+                     self._put_config,
+                 )
+             put_ms = (time.perf_counter() - put_started) * 1000.0
+-        except Exception:
++            if statuses is None:
++                statuses = [0] * len(keys)
++            if len(statuses) != len(keys):
++                raise RuntimeError(f"spec-capture batch_put_from returned {len(statuses)} statuses for {len(keys)} keys")
++            # Native TRANSFER_FAIL also covers a completion timeout. It does
++            # not establish drain; retain sources/registrations and exact keys.
++            if any(status is not None and int(status) == -800 for status in statuses):
++                raise CaptureWriterUncertain("spec-capture native transfer drain unknown (status -800)")
++            failed = [(key, status) for key, status in zip(keys, statuses)
++                      if status is not None and int(status) < 0]
++            if failed:
++                raise RuntimeError(f"spec-capture batch_put_from failed for {len(failed)}/{len(keys)} keys; first={failed[0]}")
++        except Exception as exc:
++            if getattr(exc, "capture_writer_drained", True) is False or (submitted and isinstance(exc, TimeoutError)):
++                quarantined = True
++                self._uncertain_publications.append({"tensors": tensors, "keys": keys,
++                    "registered": tuple(registered), "bytes": sum(sizes)})
++                raise CaptureWriterUncertain(str(exc)) from None
+             self._remove_many_quiet(keys)
+             raise
+         finally:
+-            for ptr in registered:
+-                try:
+-                    store.unregister_buffer(ptr)
+-                except Exception:
+-                    pass
+-
+-        if statuses is None:
+-            statuses = [0] * len(keys)
+-        if len(statuses) != len(keys):
+-            self._remove_many_quiet(keys)
+-            raise RuntimeError(
+-                "spec-capture batch_put_from returned "
+-                f"{len(statuses)} statuses for {len(keys)} keys"
+-            )
+-        failed = [
+-            (key, status)
+-            for key, status in zip(keys, statuses)
+-            if status is not None and int(status) < 0
+-        ]
+-        if failed:
+-            self._remove_many_quiet(keys)
+-            raise RuntimeError(
+-                "spec-capture batch_put_from failed for "
+-                f"{len(failed)}/{len(keys)} keys; first={failed[0]}"
+-            )
++            if not quarantined:
++                for ptr in registered:
++                    try:
++                        store.unregister_buffer(ptr)
++                    except Exception:
++                        pass
+ 
+         if timing_enabled:
+             logger.info(
 diff --git a/python/sglang/srt/spec_feature_bridge.py b/python/sglang/srt/spec_feature_bridge.py
 new file mode 100644
-index 0000000..18c2511
+index 0000000..39fba4c
 --- /dev/null
 +++ b/python/sglang/srt/spec_feature_bridge.py
-@@ -0,0 +1,751 @@
+@@ -0,0 +1,883 @@
 +"""Owner-thread bridge for complete speculative capture and fenced publication.
 +
 +The cache/controller implementation lives in spec_feature_cache.  This module
@@ -940,7 +1101,10 @@ index 0000000..18c2511
 +    message = str(exc)
 +    exc.__traceback__ = exc.__cause__ = exc.__context__ = None
 +    exc.args = (message,)
-+    return RuntimeError(message)
++    error = RuntimeError(message)
++    if getattr(exc, "capture_writer_drained", True) is False:
++        error.capture_writer_drained = False
++    return error
 +
 +
 +def digest_request(tokens, spec):
@@ -964,6 +1128,8 @@ index 0000000..18c2511
 +    drains: list = field(default_factory=list)
 +    deliveries: int = 0
 +    last_plan: dict = field(default_factory=dict)
++    object_key_layout: str | None = None
++    transfer_certificate: dict = field(default_factory=dict)
 +    cleanup_owner: str | None = None
 +    cleanup_token: str | None = None
 +    readers: dict = field(default_factory=dict)
@@ -1004,9 +1170,21 @@ index 0000000..18c2511
 +            raise ValueError("attempt registry capacity exhausted")
 +        self.sequence += 1
 +        entry = Attempt(identity, attempt_id, digest, token or uuid.uuid4().hex, self.sequence)
++        entry.object_key_layout = "attempt-v1" if body.get("publication_ownership") == "attempt-v1" else None
 +        self.active[identity] = entry
 +        self.tokens[entry.token] = entry
 +        return entry
++
++    def begin_batch(self, bodies, tokens):
++        # Validate the complete batch before changing the live registry.
++        if len(bodies) != len(tokens) or len({self.identity(body) for body in bodies}) != len(bodies):
++            raise ValueError("duplicate begin_batch identity or token count mismatch")
++        trial = AttemptRegistry(self.epoch, self.capacity)
++        trial.active, trial.tokens, trial.sequence = dict(self.active), dict(self.tokens), self.sequence
++        for body, token in zip(bodies, tokens):
++            trial.begin(body, token)
++        self.active, self.tokens, self.sequence = trial.active, trial.tokens, trial.sequence
++        return [self.active[self.identity(body)] for body in bodies]
 +
 +    def lookup(self, body):
 +        token = str(body["reservation_token"])
@@ -1172,14 +1350,17 @@ index 0000000..18c2511
 +        return any(self.gather(bool(value)))
 +
 +    def phase(self):
-+        # Called by all ranks before any prefill early-return branch.
++        # Reuse the existing rank agreement message for retirement receipts.
 +        candidates = [r.rid for r in self.s.waiting_queue]
-+        agreed = self.broadcast(candidates if self.writer else None)
++        packet = (candidates, getattr(self, "_transferred_tokens", []), getattr(self, "fatal_capture_error", None)) if self.writer else None
++        agreed, transferred, fatal = self.broadcast(packet)
++        self._sync_transfers(transferred, fatal)
 +        if not all(self.gather(candidates == agreed)):
 +            raise RuntimeError("TP waiting queue identity mismatch")
 +
 +    def capability(self):
 +        return {"protocol_version": 1, "server_epoch": self.epoch,
++                "begin_batch": True, "published_ownership": "attempt-v1",
 +                "capture_namespace": self.namespace, "capture_signature": self.signature,
 +                "schema": self.schema_wire, "cache_enabled": self.enabled,
 +                "transport": "host" if self.enabled else "official",
@@ -1197,7 +1378,9 @@ index 0000000..18c2511
 +                "cleanup_owner": entry.cleanup_owner, "cleanup_token": entry.cleanup_token,
 +                "active_readers": len(entry.readers),
 +                "state": entry.state, "writer_drained": entry.state in ("WRITER_DRAINED", "PUBLISHED", "RETIRED"),
-+                **entry.last_plan}
++                **entry.last_plan,
++                **({"object_key_layout": entry.object_key_layout} if entry.object_key_layout else {}),
++                **entry.transfer_certificate}
 +
 +    def control(self, body):
 +        try:
@@ -1205,8 +1388,24 @@ index 0000000..18c2511
 +        except ValueError as exc:
 +            raise CaptureControlRejected(str(exc)) from None
 +
++    def _sync_transfers(self, transferred=None, fatal=None):
++        if transferred is None:
++            pending = getattr(self, "_transferred_tokens", [])
++            packet = (pending, getattr(self, "fatal_capture_error", None)) if self.writer else None
++            transferred, fatal = self.broadcast(packet)
++        if fatal:
++            self.fatal_capture_error = fatal
++        if not self.writer:
++            for token in transferred:
++                entry = self.registry.tokens.get(token)
++                if entry is not None:
++                    entry.state = "PUBLISHED"
++                    self.registry.retire(entry)
++        self._transferred_tokens = []
++
 +    def _control(self, body):
 +        self.poll()
++        self._sync_transfers()
 +        if int(body.get("protocol_version", -1)) != 1:
 +            raise ValueError("unsupported capture protocol")
 +        action = body.get("action")
@@ -1219,6 +1418,16 @@ index 0000000..18c2511
 +                    "pending_deliveries": len(self.jobs), "active_readers": sum(len(x.readers) for x in self.registry.active.values()), "plans": list(self.history),
 +                    "cache": self.cache.stats() if self.cache else {},
 +                    "controller": self.controller.stats() if self.controller else {}}
++        if action in ("begin", "begin_batch") and getattr(self, "fatal_capture_error", None):
++            raise ValueError(self.fatal_capture_error)
++        if action == "begin_batch":
++            bodies = body.get("tasks")
++            if not isinstance(bodies, list) or not bodies or len(bodies) > self.registry.capacity:
++                raise ValueError("invalid begin_batch size")
++            if any(item.get("server_epoch") != self.epoch for item in bodies):
++                raise ValueError("capture server epoch changed")
++            tokens = self.broadcast([uuid.uuid4().hex for _ in bodies] if self.writer else None)
++            return {"server_epoch": self.epoch, "attempts": [self._wire(entry) for entry in self.registry.begin_batch(bodies, tokens)]}
 +        if action == "begin":
 +            token = self.broadcast(uuid.uuid4().hex if self.writer else None)
 +            return self._wire(self.registry.begin(body, token))
@@ -1300,6 +1509,11 @@ index 0000000..18c2511
 +        raise ValueError("unknown capture control action")
 +
 +    def claim(self, req):
++        # Already-reserved requests must stay TP-symmetric even when only the
++        # writer has just observed an uncertain native publication. New begin
++        # is rejected after the existing control broadcast synchronizes fatal.
++        # Host-off late requests finish with a publication error, without a new
++        # native write; cache admission also checks the shared fatal decision.
 +        spec = req.spec_capture
 +        if not spec or "protocol_version" not in spec:
 +            return
@@ -1316,6 +1530,10 @@ index 0000000..18c2511
 +        if self.enabled and set(spec.get("features", {})) != {"aux", "last_hidden"}:
 +            raise ValueError("HS cache requires complete aux and last_hidden schema")
 +        entry = self.registry.claim(spec, req.origin_input_ids)
++        if entry.object_key_layout == "attempt-v1":
++            spec["object_key_layout"] = "attempt-v1"
++        elif spec.get("object_key_layout"):
++            raise ValueError("capture key layout was not negotiated")
 +        entry.request = req
 +        req.spec_feature_attempt = entry
 +        req.spec_feature_bridge = self
@@ -1325,6 +1543,8 @@ index 0000000..18c2511
 +            req.extra_key = self.namespace
 +
 +    def invalidate(self, entry, reason):
++        if entry.transfer_certificate:
++            return  # Published immutable bytes now belong to the receiver.
 +        entry.revoked, entry.state = True, "DRAINING"
 +        req = entry.request
 +        if req is not None:
@@ -1337,7 +1557,7 @@ index 0000000..18c2511
 +
 +    def invalidate_request(self, req, reason, retract=False):
 +        entry = getattr(req, "spec_feature_attempt", None)
-+        if entry is None:
++        if entry is None or entry.transfer_certificate:
 +            return
 +        plan = getattr(req, "spec_feature_plan", None)
 +        if self.writer and self.controller and plan is not None and plan.execution not in getattr(self, "quarantined_executions", set()):
@@ -1355,7 +1575,7 @@ index 0000000..18c2511
 +        self._mark_drained(entry)
 +
 +    def _mark_drained(self, entry):
-+        if entry.revoked and entry.deliveries == 0 and all(x.done() for x in entry.drains):
++        if entry.state != "RETIRED" and entry.revoked and entry.deliveries == 0 and all(x.done() for x in entry.drains):
 +            entry.state = "WRITER_DRAINED"
 +
 +    def _rollback_match(self, req, before):
@@ -1578,33 +1798,68 @@ index 0000000..18c2511
 +        if self.controller:
 +            self.controller.poll_completed()
 +            self.controller.poll_drained()
++        ready = {}
++        # Materialization may finish out of order. One sink batch owns all ready
++        # samples for that sink; each job retains its own result future.
 +        for key, job in list(self.jobs.items()):
-+            sample = item = result = None
-+            entry, req = job["entry"], job["req"]
-+            future = job["materialize"]
++            future, entry, req = job["materialize"], job["entry"], job["req"]
 +            if future is not None and not future.done():
 +                continue
-+            # Snapshot may be ready before the output processor queues its response.
-+            if job["output"] is None and not entry.revoked and (job["plan"] is None or req.spec_feature_execution_epoch == job["plan"].execution.execution_epoch):
++            current = not entry.revoked and (job["plan"] is None or req.spec_feature_execution_epoch == job["plan"].execution.execution_epoch)
++            if job["output"] is None and current:
 +                continue
-+            error = None
++            if job["sink"] is not None:
++                continue
 +            try:
 +                if job["sample"] is None and future is not None:
 +                    job["sample"] = future.result()
-+                current = not entry.revoked and (job["plan"] is None or req.spec_feature_execution_epoch == job["plan"].execution.execution_epoch)
-+                if job["sink"] is None:
-+                    if not current:
-+                        raise RuntimeError("capture execution invalidated")
-+                    sample = job["sample"]
-+                    item = (req.spec_capture, sample.features["aux"], sample.features["last_hidden"]) if sample else job["legacy"]
-+                    import time
-+                    job["publish_started_at"] = time.perf_counter()
-+                    job["sink"] = job["sink_owner"].submit_samples([item])
-+                    entry.state = "PUBLISHING"
-+                if not job["sink"].done():
-+                    continue
-+                result = job["sink"].result()[0]
-+                import time
++                if getattr(self, "fatal_capture_error", None):
++                    raise RuntimeError(self.fatal_capture_error)
++                if not current:
++                    raise RuntimeError("capture execution invalidated")
++                sample = job["sample"]
++                item = (req.spec_capture, sample.features["aux"], sample.features["last_hidden"]) if sample else job["legacy"]
++                ready.setdefault(id(job["sink_owner"]), (job["sink_owner"], []))[1].append((job, item))
++            except Exception as exc:
++                job["sink"] = Future()
++                job["sink"].set_exception(scalar_error(exc))
++        import time
++        for sink, grouped in ready.values():
++            started = time.perf_counter()
++            children = [Future() for _ in grouped]
++            for (job, _), child in zip(grouped, children):
++                job["sink"] = child
++                job["publish_started_at"] = started
++                job["entry"].state = "PUBLISHING"
++            def distribute(future, children=children):
++                try:
++                    results = future.result()
++                    if len(results) != len(children):
++                        raise RuntimeError("capture sink batch result count mismatch")
++                except BaseException as exc:
++                    error = scalar_error(exc)
++                    for child in children:
++                        child.set_exception(error)
++                else:
++                    for child, result in zip(children, results):
++                        child.set_result(result)
++            try:
++                sink.submit_samples([item for _, item in grouped]).add_done_callback(distribute)
++            except Exception as exc:
++                failed = Future()
++                failed.set_exception(scalar_error(exc))
++                distribute(failed)
++        # Sink now owns its argument list until its future completes.
++        ready.clear()
++        grouped = item = sample = _ = None
++        for key, job in list(self.jobs.items()):
++            if job["sink"] is None or not job["sink"].done():
++                continue
++            entry, req = job["entry"], job["req"]
++            try:
++                result = job["sink"].result()
++                if entry.revoked or (job["plan"] is not None and req.spec_feature_execution_epoch != job["plan"].execution.execution_epoch):
++                    raise RuntimeError("capture cancelled during publication")
 +                timings = dict(getattr(job["sample"], "timings", {}) or {})
 +                timings["publication_queue_ms"] = (time.perf_counter() - job["publish_started_at"]) * 1000.0
 +                events = job.get("forward_events")
@@ -1615,31 +1870,67 @@ index 0000000..18c2511
 +                    if record.get("attempt_id") == entry.attempt_id and record.get("execution_epoch") == entry.last_plan.get("execution_epoch"):
 +                        record["timings"] = timings
 +                        break
-+                if not current:
-+                    raise RuntimeError("capture cancelled during publication")
++                # Validate before release: release is the controller's cache
++                # adoption boundary, so failed publications must invalidate first.
++                if entry.object_key_layout == "attempt-v1":
++                    if entry.deliveries != 1 or entry.readers or any(not handle.done() for handle in entry.drains):
++                        raise RuntimeError("capture ownership transfer before all drains")
++                    names = [*req.spec_capture.get("features", {}).values(), *(x["name"] for x in req.spec_capture.get("passthrough", ()))]
++                    base = f"{entry.identity[0]}/{entry.identity[1]}/g1/attempt/{self.epoch}/{entry.token}"
++                    keys = {name: base + "/" + name for name in names}
++                    if any(result.get("features", {}).get(name, {}).get("key") != value for name, value in keys.items()):
++                        raise RuntimeError("capture sink immutable keys mismatch")
++                # Release every server buffer and output reservation before the
++                # receiver gets an ownership certificate.
++                if job["sample"] is not None:
++                    job["sample"].release()
++                    job["sample"] = None
++                job.pop("legacy", None)
++                entry.deliveries -= 1
++                self.jobs.pop(key, None)
 +                entry.state = "PUBLISHED"
++                if entry.object_key_layout == "attempt-v1":
++                    certificate = {**self._wire(entry), "publication_ownership": "attempt-v1", "physical_keys": keys}
++                    entry.transfer_certificate = {"publication_ownership": "attempt-v1", "physical_keys": keys,
++                                                  "publication_certificate": certificate}
 +                result.update(self._wire(entry))
 +                result.update({"capture_namespace": self.namespace, "capture_signature": self.signature,
 +                               "reused_tokens": entry.last_plan.get("L", 0)})
-+                entry.state = "PUBLISHED"
++                if entry.object_key_layout == "attempt-v1":
++                    self.registry.retire(entry)
++                    if not hasattr(self, "_transferred_tokens"):
++                        self._transferred_tokens = []
++                    self._transferred_tokens.append(entry.token)
 +                if job["output"] is not None:
 +                    job["output"].set_result(result)
 +            except Exception as exc:
-+                error = scalar_error(exc)
-+                entry.revoked, entry.state = True, "DRAINING"
++                self.invalidate(entry, "capture-publication-failed")
++                if getattr(exc, "capture_writer_drained", True) is False:
++                    # A completed Python future is not proof that a native
++                    # transfer stopped reading its source. Retain every owner.
++                    drain = Future()
++                    drain.capture_owner = job
++                    entry.drains.append(drain)
++                    job["quarantined"] = True
++                    self.fatal_capture_error = "capture publication drain unknown; buffers and budgets retained"
++                    if not hasattr(self, "quarantined_publications"):
++                        self.quarantined_publications = []
++                    self.quarantined_publications.append(job)
 +                if job["output"] is not None:
-+                    job["output"].set_exception(error)
++                    job["output"].set_exception(scalar_error(exc))
 +            finally:
-+                if error is not None or (job["sink"] is not None and job["sink"].done()):
-+                    item = sample = None
-+                    if job["sample"] is not None:
++                if key in self.jobs:
++                    if job["sample"] is not None and not job.get("quarantined"):
 +                        job["sample"].release()
 +                        job["sample"] = None
 +                    entry.deliveries -= 1
 +                    self.jobs.pop(key, None)
-+                    self._mark_drained(entry)
++                self._mark_drained(entry)
 +        for outputs, aggregate in list(self.batches):
 +            if all(x.done() for x in outputs):
++                if aggregate.done():
++                    self.batches.remove((outputs, aggregate))
++                    continue
 +                try:
 +                    aggregate.set_result([x.result() for x in outputs])
 +                except Exception as exc:
@@ -1661,6 +1952,8 @@ index 0000000..18c2511
 +                time.sleep(0.001)
 +        if getattr(self, "quarantined_snapshots", None):
 +            raise RuntimeError("undrained GPU snapshots remain quarantined and charged")
++        if getattr(self, "quarantined_publications", None):
++            raise RuntimeError("undrained native publications remain quarantined and charged")
 +        if self.controller:
 +            self.controller.shutdown(wait=True)
 diff --git a/python/sglang/srt/spec_feature_cache/__init__.py b/python/sglang/srt/spec_feature_cache/__init__.py
@@ -1716,10 +2009,10 @@ index 0000000..2d64e56
 +]
 diff --git a/python/sglang/srt/spec_feature_cache/cache.py b/python/sglang/srt/spec_feature_cache/cache.py
 new file mode 100644
-index 0000000..d8c7fc6
+index 0000000..99da912
 --- /dev/null
 +++ b/python/sglang/srt/spec_feature_cache/cache.py
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,477 @@
 +"""Immutable content chunks with atomic continuous coverage and read leases."""
 +
 +from __future__ import annotations
@@ -1749,12 +2042,21 @@ index 0000000..d8c7fc6
 +
 +
 +@dataclass
++class _StorageOwner:
++    nbytes: int
++    features: dict[str, torch.Tensor]
++    keys: set[ContentBlockKey] = field(default_factory=set)
++    leases: int = 0
++
++
++@dataclass
 +class _Entry:
 +    key: ContentBlockKey
 +    nbytes: int
 +    state: str = "WRITING"
 +    features: dict[str, torch.Tensor] = field(default_factory=dict)
 +    leases: int = 0
++    owner: _StorageOwner | None = None
 +
 +
 +@dataclass
@@ -1788,6 +2090,8 @@ index 0000000..d8c7fc6
 +        self._leases: dict[str, _Lease] = {}
 +        self._fills: dict[str, _Fill] = {}
 +        self._bytes = self._peak_bytes = self._evictions = self._fill_skips = 0
++        self._logical_peak_bytes = self._adopted_samples = self._adoption_skips = 0
++        self._owned_bytes = self._owned_peak_bytes = self._owned_groups = 0
 +
 +    def _root_digest(self, namespace: str) -> str:
 +        if not isinstance(namespace, str) or not namespace:
@@ -1861,6 +2165,8 @@ index 0000000..d8c7fc6
 +            # The query and every refcount update are one metadata transaction.
 +            for entry in entries:
 +                entry.leases += 1
++                if entry.owner is not None:
++                    entry.owner.leases += 1
 +                self._lru.move_to_end(entry.key)
 +            end = len(entries) * self.chunk_tokens
 +            handle = PrefixLease(uuid.uuid4().hex, end)
@@ -1896,6 +2202,8 @@ index 0000000..d8c7fc6
 +            keep = (end + self.chunk_tokens - 1) // self.chunk_tokens
 +            for entry in rec.entries[keep:]:
 +                entry.leases -= 1
++                if entry.owner is not None:
++                    entry.owner.leases -= 1
 +            self._leases.pop(lease.lease_id)
 +            handle = PrefixLease(uuid.uuid4().hex, end)
 +            self._leases[handle.lease_id] = _Lease(handle, rec.namespace, rec.entries[:keep])
@@ -1904,6 +2212,9 @@ index 0000000..d8c7fc6
 +    def _finish_release(self, rec: _Lease) -> None:
 +        for entry in rec.entries:
 +            entry.leases -= 1
++            if entry.owner is not None:
++                entry.owner.leases -= 1
++                assert entry.owner.leases >= 0
 +            assert entry.leases >= 0
 +        self._leases.pop(rec.handle.lease_id, None)
 +
@@ -1932,14 +2243,28 @@ index 0000000..d8c7fc6
 +            rec.readers += 1
 +        failure = None
 +        try:
++            spans = []
++            for entry in entries:
++                start, stop = entry.key.start, min(end, entry.key.end)
++                if entry.owner is not None and spans and spans[-1][2] is entry.owner:
++                    old_start, _, owner, _ = spans[-1]
++                    spans[-1] = (old_start, stop, owner, None)
++                else:
++                    spans.append((start, stop, entry.owner, entry.features))
 +            with torch.no_grad():
-+                for entry in entries:
-+                    start, stop = entry.key.start, min(end, entry.key.end)
++                for start, stop, owner, block in spans:
 +                    for spec in self.schema.features:
-+                        dest[spec.name][start:stop].copy_(entry.features[spec.name][: stop - start])
++                        source = (owner.features[spec.name][start:stop] if owner is not None
++                                  else block[spec.name][:stop - start])
++                        dest[spec.name][start:stop].copy_(source)
++            # Drop source views before releasing the reader's lease protection.
++            source = owner = block = None
++            spans.clear()
 +        except BaseException as exc:
 +            failure = _normalized_error(exc)
 +        finally:
++            source = owner = block = None
++            spans.clear()
 +            with self._lock:
 +                rec.readers -= 1
 +                if rec.released and not rec.readers:
@@ -1956,30 +2281,142 @@ index 0000000..d8c7fc6
 +            if key in self._entries or self._chunk_bytes > self.capacity_bytes:
 +                self._fill_skips += 1
 +                return None
-+            while self._bytes + self._chunk_bytes > self.capacity_bytes:
-+                victim = next((k for k in self._lru if self._entries[k].leases == 0), None)
-+                if victim is None:
-+                    self._fill_skips += 1
-+                    return None
-+                entry = self._entries.pop(victim)
-+                self._lru.pop(victim)
-+                # Drop tensor storage before making the budget reusable.
-+                entry.features.clear()
-+                self._bytes -= entry.nbytes
-+                self._evictions += 1
++            if not self._make_room_locked(self._chunk_bytes):
++                self._fill_skips += 1
++                return None
 +            handle = FillReservation(uuid.uuid4().hex, key, execution, self._chunk_bytes)
 +            entry = _Entry(key, self._chunk_bytes)
 +            self._entries[key] = entry
 +            self._fills[handle.reservation_id] = _Fill(handle, entry)
 +            self._bytes += self._chunk_bytes
 +            self._peak_bytes = max(self._peak_bytes, self._bytes)
++            self._record_logical_peak_locked()
 +            return handle
++
++    def _record_logical_peak_locked(self):
++        self._logical_peak_bytes = max(self._logical_peak_bytes,
++                                       len(self._entries) * self._chunk_bytes)
++
++    def _remove_entry_locked(self, entry):
++        entry.features.clear()
++        self._entries.pop(entry.key, None)
++        self._lru.pop(entry.key, None)
++        owner = entry.owner
++        if owner is None:
++            self._bytes -= entry.nbytes
++        else:
++            owner.keys.discard(entry.key)
++            if not owner.keys:
++                # Drop the final owner references before making storage budget
++                # available. A chunk view never charges only its logical rows.
++                owner.features.clear()
++                self._bytes -= owner.nbytes
++                self._owned_bytes -= owner.nbytes
++                self._owned_groups -= 1
++            entry.owner = None
++
++    def _make_room_locked(self, amount):
++        if amount > self.capacity_bytes:
++            return False
++        while self._bytes + amount > self.capacity_bytes:
++            victim = None
++            for key in self._lru:
++                entry = self._entries[key]
++                if entry.leases:
++                    continue
++                if entry.owner is not None and entry.owner.leases:
++                    continue
++                victim = entry
++                break
++            if victim is None:
++                return False
++            # Evict an entire owner group. Partial eviction cannot free its
++            # backing allocation and only creates holes in prefix coverage.
++            keys = tuple(victim.owner.keys) if victim.owner is not None else (victim.key,)
++            for key in keys:
++                self._remove_entry_locked(self._entries[key])
++                self._evictions += 1
++        return True
++
++    def _adopt_released_sample(self, keys, features) -> bool:
++        """Take exclusive CPU ownership after every MaterializedSample reader ends.
++
++        Only the controller calls this internal path. Key hashes are prepared
++        before release. No CPU tensor allocation/copy occurs here; every chunk
++        view belongs to a group charged for its complete underlying storages,
++        including any reused prefix, padding, and incomplete tail.
++        """
++        if not keys:
++            return False
++        rows = next(iter(features.values())).shape[0]
++        self.schema.validate(features, rows, "cpu")
++        storages = {(str(t.device), t.untyped_storage().data_ptr()): t.untyped_storage().nbytes()
++                    for t in features.values()}
++        nbytes = sum(storages.values())
++        owner = _StorageOwner(nbytes, dict(features))
++        pending = []
++        failure = None
++        published = charged = False
++        entry = tensor = None
++        try:
++            with self._lock:
++                if not any(key not in self._entries for key in keys):
++                    self._adoption_skips += 1
++                    self._fill_skips += len(keys)
++                elif not self._make_room_locked(nbytes):
++                    self._adoption_skips += 1
++                    self._fill_skips += len(keys)
++                else:
++                    # Capacity eviction may itself have removed these keys.
++                    # Register every view with pending before constructing the
++                    # next one, so partial metadata errors drop all references.
++                    for key in keys:
++                        if key not in self._entries:
++                            entry = _Entry(key, self._chunk_bytes, "READY", owner=owner)
++                            pending.append(entry)
++                            for name, tensor in features.items():
++                                entry.features[name] = tensor[key.start:key.end]
++                    owner.keys.update(entry.key for entry in pending)
++                    self._bytes += nbytes
++                    self._peak_bytes = max(self._peak_bytes, self._bytes)
++                    self._owned_bytes += nbytes
++                    self._owned_groups += 1
++                    charged = True
++                    self._owned_peak_bytes = max(self._owned_peak_bytes, self._owned_bytes)
++                    for entry in pending:
++                        self._entries[entry.key] = entry
++                        self._lru[entry.key] = None
++                    self._record_logical_peak_locked()
++                    self._adopted_samples += 1
++                    self._fill_skips += len(keys) - len(pending)
++                    published = True
++        except BaseException as exc:
++            failure = _normalized_error(exc)
++        finally:
++            tensor = entry = None
++            if not published:
++                with self._lock:
++                    for entry in pending:
++                        if self._entries.get(entry.key) is entry:
++                            self._entries.pop(entry.key)
++                            self._lru.pop(entry.key, None)
++                        entry.features.clear()
++                        entry.owner = None
++                    if charged:
++                        self._bytes -= nbytes
++                        self._owned_bytes -= nbytes
++                        self._owned_groups -= 1
++                pending.clear()
++                owner.features.clear()
++                owner.keys.clear()
++                entry = None
++        if failure is not None:
++            raise failure from None
++        return published
 +
 +    def _drop_fill(self, rec: _Fill) -> None:
 +        if self._entries.get(rec.entry.key) is rec.entry:
-+            rec.entry.features.clear()
-+            self._entries.pop(rec.entry.key)
-+            self._bytes -= rec.entry.nbytes
++            self._remove_entry_locked(rec.entry)
 +        self._fills.pop(rec.handle.reservation_id, None)
 +
 +    def publish_ready(self, fill: FillReservation,
@@ -2033,22 +2470,32 @@ index 0000000..d8c7fc6
 +
 +    def stats(self) -> dict[str, int]:
 +        with self._lock:
++            ready_bytes = sum(e.nbytes for e in self._entries.values()
++                              if e.state == "READY" and e.owner is None)
++            ready_bytes += self._owned_bytes
 +            return {
 +                "ready_blocks": sum(e.state == "READY" for e in self._entries.values()),
 +                "writing_blocks": sum(e.state == "WRITING" for e in self._entries.values()),
-+                "ready_bytes": sum(e.nbytes for e in self._entries.values() if e.state == "READY"),
++                "ready_bytes": ready_bytes,
 +                "writing_bytes": sum(e.nbytes for e in self._entries.values() if e.state == "WRITING"),
 +                "cache_bytes": self._bytes, "cache_peak_bytes": self._peak_bytes,
++                "cache_logical_bytes": len(self._entries) * self._chunk_bytes,
++                "cache_logical_peak_bytes": self._logical_peak_bytes,
++                "cache_owned_bytes": self._owned_bytes,
++                "cache_owned_groups": self._owned_groups,
++                "cache_owned_peak_bytes": self._owned_peak_bytes,
++                "cache_adopted_samples": self._adopted_samples,
++                "cache_adoption_skips": self._adoption_skips,
 +                "active_leases": len(self._leases), "fill_reservations": len(self._fills),
 +                "leased_blocks": sum(e.leases > 0 for e in self._entries.values()),
 +                "evictions": self._evictions, "fill_skips": self._fill_skips,
 +            }
 diff --git a/python/sglang/srt/spec_feature_cache/controller.py b/python/sglang/srt/spec_feature_cache/controller.py
 new file mode 100644
-index 0000000..37c5f20
+index 0000000..6fcb589
 --- /dev/null
 +++ b/python/sglang/srt/spec_feature_cache/controller.py
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,584 @@
 +"""Bounded capture ownership, asynchronous D2H, full assembly and safe drain.
 +
 +B hands over compact independently owned suffix snapshots after admission.
@@ -2063,7 +2510,6 @@ index 0000000..37c5f20
 +from concurrent.futures import Future, ThreadPoolExecutor
 +from time import perf_counter
 +from dataclasses import dataclass, field
-+from typing import Mapping
 +
 +import torch
 +
@@ -2071,7 +2517,7 @@ index 0000000..37c5f20
 +from .protocol import (
 +    DTYPES, DTYPE_BYTES, AdmissionBudgetError, CaptureCancelledError, CaptureCompletion,
 +    CaptureContractError, CapturePlan, CapturedSpan, DrainHandle, ExecutionIdentity,
-+    FeatureSchema, MaterializedSample, OutputReservation, PrefixLease,
++    ContentBlockKey, FeatureSchema, MaterializedSample, OutputReservation, PrefixLease,
 +    canonical_digest, checked_int, _normalized_error,
 +)
 +
@@ -2082,6 +2528,7 @@ index 0000000..37c5f20
 +    submitted: bool = False
 +    transient_released: bool = False
 +    release_requested: bool = False
++    pinned_offset: int = 0
 +
 +
 +@dataclass
@@ -2093,6 +2540,8 @@ index 0000000..37c5f20
 +    reason: str = ""
 +    jobs: int = 0
 +    sample: MaterializedSample | None = None
++    owned_output: dict[str, torch.Tensor] = field(default_factory=dict)
++    cache_keys: tuple[ContentBlockKey, ...] = ()
 +    fills: dict[str, object] = field(default_factory=dict)
 +    quarantined: list[object] = field(default_factory=list)
 +    completion_pending: bool = False
@@ -2123,7 +2572,8 @@ index 0000000..37c5f20
 +    def __init__(self, cache: PrefixFeatureCache, schema: FeatureSchema,
 +                 pinned_budget_bytes: int = 256 * 1024**2,
 +                 output_budget_bytes: int = 512 * 1024**2,
-+                 device_budget_bytes: int = 256 * 1024**2):
++                 device_budget_bytes: int = 256 * 1024**2, *,
++                 max_workers: int = 4):
 +        if not isinstance(cache, PrefixFeatureCache) or schema != cache.schema:
 +            raise CaptureContractError("controller/cache schema mismatch")
 +        self.cache, self.schema = cache, schema
@@ -2140,6 +2590,9 @@ index 0000000..37c5f20
 +        self._limits["pinned"] = (1 << (pinned_budget_bytes.bit_length() - 1)
 +                                  if pinned_budget_bytes else 0)
 +        self._pinned_arena = None
++        self._slot_alignment = max(DTYPE_BYTES[f.dtype] for f in schema.features)
++        self._pinned_free = [(0, self._limits["pinned"])]
++        self._max_workers = checked_int(max_workers, "max_workers", 1)
 +        self._arena_poisoned = False
 +        self._current = dict.fromkeys(self._limits, 0)
 +        self._peaks = dict.fromkeys(self._limits, 0)
@@ -2151,7 +2604,9 @@ index 0000000..37c5f20
 +        self._max_pending = max(1, min(4096, output_budget_bytes // schema.row_bytes))
 +        self._closed = False
 +        self._fill_failures = 0
-+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spec-feature-capture")
++        self._adoption_calls = 0
++        self._adoption_total_ms = self._adoption_max_ms = 0.0
++        self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="spec-feature-capture")
 +
 +    def _staging_layout(self, rows):
 +        offset, layout = 0, {}
@@ -2161,23 +2616,57 @@ index 0000000..37c5f20
 +            size = rows * spec.width * itemsize
 +            layout[spec.name] = (offset, size, spec)
 +            offset += size
++        offset = ((offset + self._slot_alignment - 1) // self._slot_alignment) * self._slot_alignment
 +        return offset, layout
 +
-+    def _staging_views(self, rows):
++    def _staging_views(self, rows, reservation=None):
 +        required, layout = self._staging_layout(rows)
 +        if required > self._limits["pinned"]:
 +            raise AdmissionBudgetError("aligned suffix exceeds pinned arena capacity")
 +        with self._lock:
 +            if self._arena_poisoned:
 +                raise CaptureContractError("pinned arena quarantined after unproven DMA drain")
-+        if self._pinned_arena is None:
-+            arena = torch.empty((self._limits["pinned"],), dtype=torch.uint8,
-+                                device="cpu", pin_memory=True)
-+            with self._lock:
-+                self._pinned_arena = arena
-+        return {name: self._pinned_arena[offset:offset + size]
-+                .view(DTYPES[spec.dtype]).view(rows, spec.width)
-+                for name, (offset, size, spec) in layout.items()}
++            offset = 0
++            if reservation is not None:
++                rec = self._reservation(reservation)
++                if rec.transient_released or required > reservation.pinned_bytes:
++                    raise CaptureContractError("staging slot is released or too small")
++                offset = rec.pinned_offset
++            elif self._current["pinned"]:
++                raise CaptureContractError("unreserved staging view while slots are active")
++            # Allocate once under the lock: workers must never race to create
++            # two retained power-of-two pinned allocations.
++            if self._pinned_arena is None:
++                self._pinned_arena = torch.empty((self._limits["pinned"],), dtype=torch.uint8,
++                                                device="cpu", pin_memory=True)
++            return {name: self._pinned_arena[offset + start:offset + start + size]
++                    .view(DTYPES[spec.dtype]).view(rows, spec.width)
++                    for name, (start, size, spec) in layout.items()}
++
++    def _allocate_slot_locked(self, amount):
++        if not amount:
++            return 0
++        for i, (start, size) in enumerate(self._pinned_free):
++            if size >= amount:
++                if size == amount:
++                    self._pinned_free.pop(i)
++                else:
++                    self._pinned_free[i] = (start + amount, size - amount)
++                return start
++        return None
++
++    def _free_slot_locked(self, start, amount):
++        if not amount:
++            return
++        self._pinned_free.append((start, amount))
++        merged = []
++        for offset, size in sorted(self._pinned_free):
++            if merged and merged[-1][0] + merged[-1][1] == offset:
++                old, length = merged[-1]
++                merged[-1] = (old, length + size)
++            else:
++                merged.append((offset, size))
++        self._pinned_free = merged
 +
 +    def try_reserve_output(self, execution: ExecutionIdentity, N: int, L: int,
 +                           passthrough_bytes: int) -> OutputReservation | None:
@@ -2204,9 +2693,12 @@ index 0000000..37c5f20
 +            if len(self._executions) >= self._max_pending or any(
 +                    self._current[k] + charges[k] > self._limits[k] for k in charges):
 +                return None
++            slot = self._allocate_slot_locked(charges["pinned"])
++            if slot is None:
++                return None  # Fragmentation cannot authorize overlapping DMA slots.
 +            handle = OutputReservation(uuid.uuid4().hex, execution, charges["output"],
 +                                       charges["pinned"], charges["device"], N, L, passthrough_bytes)
-+            self._reservations[handle.reservation_id] = _Reservation(handle)
++            self._reservations[handle.reservation_id] = _Reservation(handle, pinned_offset=slot)
 +            state = _Execution(execution, {handle.reservation_id})
 +            self._executions[execution] = state
 +            for kind, amount in charges.items():
@@ -2247,6 +2739,7 @@ index 0000000..37c5f20
 +        if rec.transient_released:
 +            return
 +        rec.transient_released = True
++        self._free_slot_locked(rec.pinned_offset, rec.handle.pinned_bytes)
 +        self._current["pinned"] -= rec.handle.pinned_bytes
 +        self._current["device"] -= rec.handle.device_bytes
 +
@@ -2293,9 +2786,27 @@ index 0000000..37c5f20
 +                return
 +            state = self._executions[reservation.execution]
 +            state.sample = None
-+            self._release_transient_locked(rec)
-+            self._release_host_locked(rec, state)
-+            self._maybe_drained_locked(state)
++            owned, state.owned_output = state.owned_output, {}
++            adoption_started = perf_counter()
++            try:
++                # MaterializedSample.release has already removed the sink's
++                # tensor references. Readers may not access or modify them
++                # after this ownership transfer. Keep the output charge until
++                # the cache has charged every retained backing allocation.
++                if owned and not state.cancelled and not rec.release_requested and not self._closed:
++                    self._adoption_calls += 1
++                    self.cache._adopt_released_sample(state.cache_keys, owned)
++            except Exception:
++                self._fill_failures += 1
++            finally:
++                elapsed_ms = (perf_counter() - adoption_started) * 1000.0
++                self._adoption_total_ms += elapsed_ms
++                self._adoption_max_ms = max(self._adoption_max_ms, elapsed_ms)
++                state.cache_keys = ()
++                owned.clear()
++                self._release_transient_locked(rec)
++                self._release_host_locked(rec, state)
++                self._maybe_drained_locked(state)
 +
 +    def submit(self, plan: CapturePlan, span: CapturedSpan) -> Future[MaterializedSample]:
 +        if not isinstance(plan, CapturePlan) or not isinstance(span, CapturedSpan):
@@ -2375,7 +2886,7 @@ index 0000000..37c5f20
 +                stream = torch.cuda.Stream(device=device)
 +                with torch.cuda.stream(stream):
 +                    stream.wait_event(job.ready_event)
-+                    staging = self._staging_views(job.plan.N - job.plan.L)
++                    staging = self._staging_views(job.plan.N - job.plan.L, job.plan.reservation)
 +                    for name, source in job.features.items():
 +                        target = staging[name]
 +                        target.copy_(source, non_blocking=True)
@@ -2403,42 +2914,15 @@ index 0000000..37c5f20
 +            staging.clear()
 +            raise
 +
-+    def _fill_cache(self, job: _Job, output: Mapping[str, torch.Tensor]) -> None:
++    def _prepare_cache_adoption(self, job: _Job) -> tuple:
++        # Hash/construct keys on the assembly worker, never in the sink release
++        # callback (which may run on the scheduler thread).
 +        try:
-+            keys = self.cache.block_keys(job.plan.namespace, job.plan.tokens)
++            return self.cache.block_keys(job.plan.namespace, job.plan.tokens)
 +        except Exception:
 +            with self._lock:
 +                self._fill_failures += 1
-+            return
-+        for key in keys:
-+            if self._cancelled(job):
-+                return
-+            try:
-+                fill = self.cache.reserve_fill(key, job.plan.execution)
-+            except Exception:
-+                with self._lock:
-+                    self._fill_failures += 1
-+                continue
-+            if fill is None:
-+                continue
-+            with self._lock:
-+                if job.state.cancelled:
-+                    self.cache.abort_fill(fill)
-+                    return
-+                job.state.fills[fill.reservation_id] = fill
-+            try:
-+                published = self.cache.publish_ready(fill, {name: tensor[key.start:key.end]
-+                                               for name, tensor in output.items()})
-+                if not published:
-+                    self.cache.abort_fill(fill)
-+            except Exception:
-+                # Cache population is optional; complete sample delivery is not.
-+                self.cache.abort_fill(fill)
-+                with self._lock:
-+                    self._fill_failures += 1
-+            finally:
-+                with self._lock:
-+                    job.state.fills.pop(fill.reservation_id, None)
++            return ()
 +
 +    def _run_job(self, job: _Job) -> None:
 +        output, staging = {}, {}
@@ -2469,7 +2953,7 @@ index 0000000..37c5f20
 +                raise CaptureCancelledError(job.state.reason or "execution released")
 +            self.schema.validate(output, job.plan.N, "cpu")
 +            assembled_at = perf_counter()
-+            self._fill_cache(job, output)
++            cache_keys = self._prepare_cache_adoption(job)
 +            filled_at = perf_counter()
 +            sample = MaterializedSample(job.plan.execution, output, job.plan.N,
 +                        lambda: self._sample_released(job.plan.reservation), timings={
@@ -2477,8 +2961,10 @@ index 0000000..37c5f20
 +                            "assembly_ms": (assembled_at - copied_at) * 1000.0,
 +                            "cache_fill_ms": (filled_at - assembled_at) * 1000.0,
 +                        })
-+            output.clear()
 +            with self._lock:
++                job.state.owned_output = dict(output)
++                job.state.cache_keys = cache_keys
++                output.clear()
 +                if self._cancelled(job):
 +                    sample.release()
 +                    sample = None
@@ -2560,7 +3046,7 @@ index 0000000..37c5f20
 +                    self._reap_locked(state)
 +            return result
 +
-+    def stats(self) -> dict[str, int]:
++    def stats(self) -> dict[str, int | float]:
 +        result = self.cache.stats()
 +        with self._lock:
 +            result.update({f"{k}_bytes": v for k, v in self._current.items()})
@@ -2569,7 +3055,13 @@ index 0000000..37c5f20
 +                          pending_copies=sum(s.jobs for s in self._executions.values()),
 +                          output_reservations=len(self._reservations),
 +                          quarantined_executions=sum(bool(s.quarantined) for s in self._executions.values()),
-+                          fill_failures=self._fill_failures)
++                          fill_failures=self._fill_failures,
++                          capture_workers=self._max_workers,
++                          cache_adoption_calls=self._adoption_calls,
++                          cache_adoption_total_ms=self._adoption_total_ms,
++                          cache_adoption_max_ms=self._adoption_max_ms,
++                          pinned_free_bytes=sum(size for _, size in self._pinned_free),
++                          pinned_free_slots=len(self._pinned_free))
 +            result.update(pinned_configured_bytes=self._pinned_configured_bytes,
 +                          pinned_capacity_bytes=self._limits["pinned"],
 +                          pinned_arena_bytes=(self._pinned_arena.numel() if self._pinned_arena is not None else 0),
@@ -3014,6 +3506,210 @@ index 0000000..c43a666
 +
 +if __name__ == "__main__":
 +    unittest.main()
+diff --git a/test/registered/spec_feature_bridge/test_publication_transfer.py b/test/registered/spec_feature_bridge/test_publication_transfer.py
+new file mode 100644
+index 0000000..47a8bc6
+--- /dev/null
++++ b/test/registered/spec_feature_bridge/test_publication_transfer.py
+@@ -0,0 +1,198 @@
++"""Batch sink completion, atomic reservations and explicit publication transfer."""
++import importlib.util
++import pathlib
++import sys
++import types
++import unittest
++from concurrent.futures import Future
++
++FILE = pathlib.Path(__file__).resolve().parents[3] / 'python/sglang/srt/spec_feature_bridge.py'
++spec = importlib.util.spec_from_file_location('sglang_bridge_transfer_test', FILE)
++bridge = importlib.util.module_from_spec(spec)
++sys.modules[spec.name] = bridge
++spec.loader.exec_module(bridge)
++
++
++class PublicationTests(unittest.TestCase):
++    def owner(self):
++        owner = object.__new__(bridge.SpecFeatureBridge)
++        owner.writer, owner.controller, owner.cache = True, None, None
++        owner.epoch, owner.namespace, owner.signature = 'epoch', 'namespace', 'signature'
++        owner.s = types.SimpleNamespace(ps=types.SimpleNamespace(tp_size=1))
++        owner.registry = bridge.AttemptRegistry('epoch', 4)
++        owner.jobs, owner.batches, owner.history = {}, [], []
++        return owner
++
++    def pending(self, owner, index, *, immutable=False):
++        body = dict(store_id='s', sample_id=str(index), gen=1, attempt_id=str(index), request_digest='d')
++        if immutable:
++            body['publication_ownership'] = 'attempt-v1'
++        entry = owner.registry.begin(body, 'token' + str(index))
++        capture = dict(**body, server_epoch='epoch', reservation_token=entry.token,
++                       features=dict(aux='hidden', last_hidden='target'), passthrough=[])
++        if immutable:
++            capture['object_key_layout'] = 'attempt-v1'
++        req = types.SimpleNamespace(rid=str(index), spec_feature_attempt=entry, spec_capture=capture,
++                                    spec_feature_execution_epoch=0)
++        entry.request = req
++        return (req, capture, object(), object(), False, 0.)
++
++    def test_single_sink_batch_distributes_scalar_results_in_order(self):
++        owner = self.owner()
++        submitted = []
++        future = Future()
++        def submit(items):
++            submitted.append(items)
++            return future
++        completed = owner.queue_captures([self.pending(owner, i) for i in range(3)], types.SimpleNamespace(submit_samples=submit))
++        self.assertEqual([len(items) for items in submitted], [3])
++        self.assertFalse(completed.done())
++        future.set_result([dict(value=i) for i in range(3)])
++        owner.poll()
++        self.assertEqual([row['value'] for row in completed.result()], [0, 1, 2])
++        self.assertFalse(owner.jobs)
++
++    def test_batch_count_mismatch_fails_every_child_and_drains(self):
++        owner = self.owner()
++        future = Future()
++        completed = owner.queue_captures([self.pending(owner, i) for i in range(2)], types.SimpleNamespace(submit_samples=lambda items: future))
++        future.set_result([{}])
++        owner.poll()
++        with self.assertRaisesRegex(RuntimeError, 'count mismatch'):
++            completed.result()
++        self.assertFalse(owner.jobs)
++        self.assertTrue(all(entry.state == 'WRITER_DRAINED' for entry in owner.registry.active.values()))
++
++    def test_transfer_certificate_after_release_and_retired_resolution(self):
++        owner = self.owner()
++        pending = self.pending(owner, 0, immutable=True)
++        req, entry = pending[0], pending[0].spec_feature_attempt
++        keys = {name: f's/0/g1/attempt/epoch/{entry.token}/{name}' for name in ('hidden', 'target')}
++        result = dict(features={name: dict(key=key) for name, key in keys.items()})
++        future = Future()
++        completed = owner.queue_captures([pending], types.SimpleNamespace(submit_samples=lambda items: future))
++        released = []
++        owner.jobs[('0', 0)]['sample'] = types.SimpleNamespace(release=lambda: released.append(True), timings={})
++        future.set_result([result])
++        owner.poll()
++        self.assertTrue(released)
++        wire = completed.result()[0]
++        self.assertEqual(wire['state'], 'PUBLISHED')
++        self.assertEqual(wire['publication_ownership'], 'attempt-v1')
++        self.assertEqual(wire['physical_keys'], keys)
++        self.assertFalse(owner.registry.active)
++        # A lost /generate reply can recover the historical publication proof.
++        resolved = owner.control(dict(req.spec_capture, protocol_version=1, action='resolve', cancel=True))
++        self.assertEqual(resolved['state'], 'RETIRED')
++        self.assertEqual(resolved['publication_certificate']['state'], 'PUBLISHED')
++        self.assertEqual(resolved['physical_keys'], keys)
++
++    def test_begin_batch_failure_has_no_partial_reservations(self):
++        owner = self.owner()
++        body = dict(store_id='s', sample_id='0', gen=1, attempt_id='a', request_digest='d')
++        invalid = dict(body, sample_id='1', attempt_id='')
++        with self.assertRaises(ValueError):
++            owner.registry.begin_batch([body, invalid], ['t0', 't1'])
++        self.assertEqual(owner.registry.active, {})
++        self.assertEqual(owner.registry.sequence, 0)
++        with self.assertRaises(ValueError):
++            owner.registry.begin_batch([body, body], ['t0', 't1'])
++        self.assertEqual(owner.registry.active, {})
++
++    def test_evicted_tombstone_fails_closed(self):
++        owner = self.owner()
++        owner.registry = bridge.AttemptRegistry('epoch', 1)
++        body = dict(store_id='s', sample_id='old', gen=1, attempt_id='a', request_digest='d')
++        old = owner.registry.begin(body, 'old')
++        old.state = 'PUBLISHED'
++        owner.registry.retire(old)
++        new = owner.registry.begin(dict(body, sample_id='new'), 'new')
++        new.state = 'PUBLISHED'
++        owner.registry.retire(new)
++        with self.assertRaisesRegex(ValueError, 'unknown'):
++            owner.control(dict(body, protocol_version=1, server_epoch='epoch', reservation_token='old', action='resolve'))
++
++
++if __name__ == '__main__':
++    unittest.main()
++
++class UncertainPublicationTests(PublicationTests):
++    def test_unknown_native_writer_retains_sample_and_fence(self):
++        owner = self.owner()
++        pending = self.pending(owner, 0, immutable=True)
++        future = Future()
++        completed = owner.queue_captures([pending], types.SimpleNamespace(submit_samples=lambda items: future))
++        released = []
++        owner.jobs[('0', 0)]['sample'] = types.SimpleNamespace(release=lambda: released.append(True), timings={})
++        error = RuntimeError('native timeout')
++        error.capture_writer_drained = False
++        future.set_exception(error)
++        owner.poll()
++        with self.assertRaises(RuntimeError):
++            completed.result()
++        self.assertFalse(released)
++        entry = pending[0].spec_feature_attempt
++        self.assertEqual(entry.state, 'DRAINING')
++        self.assertTrue(entry.drains)
++        self.assertFalse(entry.drains[-1].done())
++        self.assertEqual(len(owner.quarantined_publications), 1)
++        self.assertFalse(entry.transfer_certificate)
++        with self.assertRaisesRegex(ValueError, 'drain unknown'):
++            owner.control(dict(protocol_version=1, server_epoch='epoch', action='begin'))
++
++
++class NativeSinkUncertaintyTests(unittest.TestCase):
++    def test_transfer_fail_retains_native_registration_and_source(self):
++        import os
++        import torch
++        from unittest import mock
++        sink_file = FILE.with_name('spec_capture_sink.py')
++        module_spec = importlib.util.spec_from_file_location('sglang_sink_transfer_test', sink_file)
++        module = importlib.util.module_from_spec(module_spec)
++        module_spec.loader.exec_module(module)
++        events = []
++        backend = types.SimpleNamespace(register_buffer=lambda ptr, size: events.append('register') or 0,
++            unregister_buffer=lambda ptr: events.append('unregister'),
++            batch_put_from=lambda *args: [-800], remove=lambda key: events.append('remove'))
++        sink = module.SpecCaptureSink()
++        sink._store = backend
++        spec = dict(store_id='s', sample_id='sample', gen=1, server_epoch='epoch', reservation_token='token',
++                    object_key_layout='attempt-v1', features=dict(aux='hidden'))
++        with mock.patch.dict(os.environ, {'MOONCAKE_PROTOCOL': 'tcp', 'SGLANG_SPEC_CAPTURE_GPU_PUT': '0'}):
++            with self.assertRaises(module.CaptureWriterUncertain):
++                sink.put_samples([(spec, torch.ones(2, 2), None)])
++        self.assertEqual(events, ['register'])
++        self.assertEqual(len(sink._uncertain_publications), 1)
++        self.assertEqual(sink._uncertain_publications[0]['keys'], ['s/sample/g1/attempt/epoch/token/hidden'])
++        self.assertTrue(sink._uncertain_publications[0]['tensors'])
++        sink._executor.shutdown()
++
++class FatalAgreementTests(unittest.TestCase):
++    def test_late_reserved_claim_is_symmetric_and_new_begin_rejected_on_both_ranks(self):
++        fixture = PublicationTests()
++        writer, follower = fixture.owner(), fixture.owner()
++        follower.writer = False
++        writer.enabled = follower.enabled = False
++        late = [fixture.pending(owner, 0, immutable=True) for owner in (writer, follower)]
++        writer.fatal_capture_error = 'native writer drain unknown'
++        for owner, pending in zip((writer, follower), late):
++            req = pending[0]
++            req.spec_capture.update(protocol_version=1, capture_namespace='namespace', capture_signature='signature')
++            req.origin_input_ids = [1, 2]
++            req.spec_feature_attempt.request_digest = bridge.digest_request(req.origin_input_ids, req.spec_capture)
++            req.sampling_params = types.SimpleNamespace(max_new_tokens=0)
++            for name in ('multimodal_inputs', 'session', 'lora_id', 'positional_embed_overrides', 'cache_salt', 'session_id'):
++                setattr(req, name, None)
++            owner.claim(req)  # Even writer-only fatal must not split these claims.
++            self.assertTrue(req.spec_feature_attempt.claimed)
++        calls = []
++        completed = writer.queue_captures([late[0]], types.SimpleNamespace(submit_samples=lambda items: calls.append(items)))
++        with self.assertRaisesRegex(RuntimeError, 'drain unknown'):
++            completed.result()
++        self.assertFalse(calls)
++        follower.broadcast = lambda value: ([], writer.fatal_capture_error)
++        body = dict(action='begin', protocol_version=1, server_epoch='epoch')
++        for owner in (writer, follower):
++            with self.assertRaisesRegex(ValueError, 'drain unknown'):
++                owner.control(body)
++        self.assertEqual(writer.fatal_capture_error, follower.fatal_capture_error)
 diff --git a/test/registered/spec_feature_bridge/test_runtime_integration.py b/test/registered/spec_feature_bridge/test_runtime_integration.py
 new file mode 100644
 index 0000000..1bf2e0e
@@ -3290,6 +3986,150 @@ index 0000000..2440720
 +
 +if __name__ == '__main__':
 +    unittest.main()
+diff --git a/test/registered/spec_feature_cache/test_controller_parallel_cuda.py b/test/registered/spec_feature_cache/test_controller_parallel_cuda.py
+new file mode 100644
+index 0000000..b081790
+--- /dev/null
++++ b/test/registered/spec_feature_cache/test_controller_parallel_cuda.py
+@@ -0,0 +1,138 @@
++"""Explicitly scheduled real-CUDA checks for concurrent capture landing slots.
++
++Run on one allocated GPU with SGLANG_RUN_SPEC_FEATURE_CUDA_TESTS=1. The event
++wrapper gates only the host's completion observation; all CUDA streams, DMA
++copies, and underlying events remain real. CPU discovery never initializes CUDA.
++"""
++
++import json
++import os
++import threading
++import unittest
++from unittest import mock
++
++import torch
++
++from sglang.srt.spec_feature_cache import (
++    CaptureCancelledError,
++    CaptureController,
++    CapturedSpan,
++    ExecutionIdentity,
++    FeatureSchema,
++    FeatureSpec,
++    PrefixFeatureCache,
++)
++
++
++@unittest.skipUnless(
++    os.environ.get("SGLANG_RUN_SPEC_FEATURE_CUDA_TESTS") == "1",
++    "requires an explicitly allocated CUDA GPU",
++)
++class ConcurrentCaptureCudaTests(unittest.TestCase):
++    def run_pair(self, cancel_first):
++        self.assertTrue(torch.cuda.is_available())
++        schema = FeatureSchema((FeatureSpec("aux", 16, "bfloat16", (1,)),
++                                FeatureSpec("last_hidden", 16, "bfloat16", ())))
++        rows = 4096
++        sample_bytes = rows * schema.row_bytes
++        cache = PrefixFeatureCache(schema, 256, sample_bytes * 4)
++        controller = CaptureController(cache, schema, sample_bytes * 2,
++                                       sample_bytes * 4, sample_bytes * 2, max_workers=2)
++        plans, spans, expected, samples = [], [], [], []
++        tokens = tuple(range(rows))
++        for i in range(2):
++            execution = ExecutionIdentity("cuda-probe", str(i), str(i), 0)
++            namespace = f"cuda-{i}"
++            lease = cache.lookup_and_pin(namespace, tokens, 0)
++            reservation = controller.try_reserve_output(execution, rows, 0, 0)
++            self.assertIsNotNone(reservation)
++            plans.append(controller.freeze_plan(execution, namespace, tokens, rows, 0,
++                                                lease, reservation))
++            cpu = ((torch.arange(rows * 16).reshape(rows, 16) % 113) + i).to(torch.bfloat16)
++            expected.append({"aux": cpu.clone(), "last_hidden": cpu + 5})
++            values = {name: tensor.to("cuda") for name, tensor in expected[-1].items()}
++            producer = torch.cuda.Event()
++            producer.record(torch.cuda.current_stream())
++            spans.append(CapturedSpan(execution, 0, rows, values, producer))
++        # Each worker must enqueue its own real D2H before either completion
++        # observation is allowed to return. This exposes overlapping ownership
++        # even on devices whose physical DMA engines serialize the transfers.
++        submitted = threading.Barrier(3)
++        finish = threading.Event()
++        real_event = torch.cuda.Event
++        class CopyEvent:
++            def __init__(self):
++                self.event = real_event()
++            def record(self, stream):
++                self.event.record(stream)
++            def synchronize(self):
++                submitted.wait(10)
++                if not finish.wait(10):
++                    raise RuntimeError("CUDA test host gate did not open")
++                self.event.synchronize()
++        futures = []
++        try:
++            with mock.patch("sglang.srt.spec_feature_cache.controller.torch.cuda.Event", CopyEvent):
++                futures = [controller.submit(plan, span) for plan, span in zip(plans, spans)]
++                spans.clear()
++                values = None
++                submitted.wait(10)
++                self.assertTrue(all(not future.done() for future in futures))
++                self.assertEqual(controller.stats()["pinned_bytes"], sample_bytes * 2)
++                offsets = [controller._reservations[p.reservation.reservation_id].pinned_offset
++                           for p in plans]
++                self.assertEqual(abs(offsets[1] - offsets[0]), sample_bytes)
++                extra = ExecutionIdentity("cuda-probe", "extra", "extra", 0)
++                self.assertIsNone(controller.try_reserve_output(extra, 4, 0, 0))
++                drain = None
++                if cancel_first:
++                    drain = controller.invalidate(plans[0].execution, "real DMA cancellation")
++                    self.assertFalse(drain.done())
++                    self.assertEqual(controller.stats()["pinned_bytes"], sample_bytes * 2)
++                finish.set()
++                for i, future in enumerate(futures):
++                    if cancel_first and i == 0:
++                        with self.assertRaises(CaptureCancelledError):
++                            future.result(10)
++                    else:
++                        sample = future.result(10)
++                        samples.append(sample)
++                        for name, tensor in sample.features.items():
++                            self.assertTrue(torch.equal(tensor, expected[i][name]))
++                if drain is not None:
++                    self.assertTrue(drain.wait(2))
++                self.assertEqual(controller.stats()["pinned_bytes"], 0)
++                self.assertEqual(controller.stats()["device_bytes"], 0)
++            for sample in samples:
++                sample.release()
++            self.assertEqual(cache.stats()["ready_blocks"], 16 * (1 if cancel_first else 2))
++            stats = controller.stats()
++            self.assertEqual(stats["output_bytes"], 0)
++            self.assertEqual(stats["quarantined_executions"], 0)
++            self.assertEqual(stats["pinned_arena_bytes"], sample_bytes * 2)
++            self.assertEqual(stats["pinned_free_bytes"], sample_bytes * 2)
++            print(json.dumps({"real_cuda": True, "cancel_first": cancel_first,
++                              "concurrently_submitted_d2h": 2, "bitexact": True,
++                              "stats": stats}))
++        finally:
++            finish.set()
++            for future in futures:
++                try:
++                    future.result(15).release()
++                except Exception:
++                    pass
++            for sample in samples:
++                sample.release()
++            controller.poll_completed()
++            controller.poll_drained()
++            controller.shutdown()
++
++    def test_two_real_d2h_jobs_are_isolated_and_bitexact(self):
++        self.run_pair(False)
++
++    def test_cancelled_real_d2h_slot_stays_owned_until_observed_drain(self):
++        self.run_pair(True)
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/test/registered/spec_feature_cache/test_gdn_checkpoint_precision_cuda.py b/test/registered/spec_feature_cache/test_gdn_checkpoint_precision_cuda.py
 new file mode 100644
 index 0000000..7224187
@@ -3384,10 +4224,10 @@ index 0000000..7224187
 +    unittest.main()
 diff --git a/test/registered/spec_feature_cache/test_runtime.py b/test/registered/spec_feature_cache/test_runtime.py
 new file mode 100644
-index 0000000..ed26d7e
+index 0000000..bffc055
 --- /dev/null
 +++ b/test/registered/spec_feature_cache/test_runtime.py
-@@ -0,0 +1,600 @@
+@@ -0,0 +1,733 @@
 +"""CPU-only adversarial tests of the production Plan A cache/controller."""
 +
 +import gc
@@ -3643,6 +4483,60 @@ index 0000000..ed26d7e
 +        self.assertTrue(all(ref() is None for ref in allocated))
 +        self.assertEqual(self.cache.stats()["cache_bytes"], 0)
 +
++    def test_owner_group_charges_entire_storage_and_any_lease_blocks_eviction(self):
++        cache = PrefixFeatureCache(schema(), 4, 160)
++        tokens = tuple(range(9))
++        values = features(9)
++        self.assertTrue(cache._adopt_released_sample(cache.block_keys("ns", tokens), values))
++        values.clear()  # Ownership has transferred; callers retain no aliases.
++        self.assertEqual(cache.stats()["cache_bytes"], 144)
++        self.assertEqual(cache.stats()["cache_logical_bytes"], 128)
++        lease = cache.lookup_and_pin("ns", tokens, 4)
++        different = cache.block_keys("other", (9, 8, 7, 6))[0]
++        self.assertIsNone(cache.reserve_fill(different, identity(2)))
++        self.assertEqual(cache.stats()["ready_blocks"], 2)
++        self.assertEqual(cache.stats()["cache_bytes"], 144)
++        out = features(4, 100)
++        cache.copy_prefix_into(lease, 4, out)
++        self.assertTrue(torch.equal(out["aux"], features(4)["aux"]))
++        cache.release_lease(lease)
++        fill = cache.reserve_fill(different, identity(2))
++        self.assertIsNotNone(fill)
++        self.assertEqual(cache.stats()["ready_blocks"], 0)
++        self.assertEqual(cache.stats()["cache_owned_bytes"], 0)
++        self.assertEqual(cache.stats()["cache_bytes"], 64)
++        cache.abort_fill(fill)
++
++    def test_contiguous_owner_prefix_uses_one_copy_per_feature(self):
++        cache = PrefixFeatureCache(schema(), 4, 160)
++        tokens = tuple(range(9))
++        values = features(9)
++        cache._adopt_released_sample(cache.block_keys("ns", tokens), values)
++        values.clear()
++        lease = cache.lookup_and_pin("ns", tokens, 8)
++        out = features(8, 100)
++        copies = []
++        real_copy = torch.Tensor.copy_
++        def copy(target, source, *args, **kwargs):
++            copies.append(tuple(target.shape))
++            return real_copy(target, source, *args, **kwargs)
++        with mock.patch.object(torch.Tensor, "copy_", copy):
++            cache.copy_prefix_into(lease, 8, out)
++        cache.release_lease(lease)
++        self.assertEqual(copies, [(8, 2), (8, 2)])
++        self.assertTrue(torch.equal(out["aux"], features(8)["aux"]))
++
++    def test_adoption_counts_hidden_backing_storage_and_rejects_oversize(self):
++        values = {name: tensor[:4] for name, tensor in features(9).items()}
++        keys = self.cache.block_keys("ns", self.tokens[:4])
++        self.assertFalse(self.cache._adopt_released_sample(keys, values))
++        self.assertEqual(self.cache.stats()["cache_bytes"], 0)
++        larger = PrefixFeatureCache(schema(), 4, 160)
++        self.assertTrue(larger._adopt_released_sample(keys, values))
++        self.assertEqual(larger.stats()["cache_bytes"], 144)
++        self.assertEqual(larger.stats()["cache_logical_bytes"], 64)
++
++
 +
 +class ControllerTests(unittest.TestCase):
 +    def setUp(self):
@@ -3679,8 +4573,9 @@ index 0000000..ed26d7e
 +    def test_full_sample_from_non_aligned_prefix_and_suffix(self):
 +        cold = self.take(self.submit(self.plan(n=9)))
 +        self.assertTrue(torch.equal(cold.features["aux"], features(9)["aux"]))
-+        self.assertEqual(self.cache.stats()["ready_blocks"], 2)
++        self.assertEqual(self.cache.stats()["ready_blocks"], 0)
 +        cold.release()
++        self.assertEqual(self.cache.stats()["ready_blocks"], 2)
 +        self.controller.poll_completed()
 +        self.controller.poll_drained()
 +        plan = self.plan(n=9, L=5, execution=identity(1))
@@ -3846,28 +4741,106 @@ index 0000000..ed26d7e
 +        self.assertEqual(len(completions), 1)
 +        self.assertIsNotNone(completions[0].error)
 +
-+    def test_cache_fill_failure_keeps_complete_sample_delivery(self):
-+        plan = self.plan()
-+        with mock.patch.object(self.cache, "publish_ready", side_effect=RuntimeError("cache copy failed")):
-+            sample = self.take(self.submit(plan))
++    def test_cache_adoption_failure_keeps_complete_sample_delivery(self):
++        sample = self.take(self.submit(self.plan()))
 +        self.assertTrue(torch.equal(sample.features["aux"], features(8)["aux"]))
-+        self.assertEqual(self.cache.stats()["writing_blocks"], 0)
++        with mock.patch.object(self.cache, "_adopt_released_sample", side_effect=RuntimeError("cache metadata failed")):
++            sample.release()
 +        self.assertEqual(self.cache.stats()["cache_bytes"], 0)
-+        self.assertEqual(self.controller.stats()["fill_failures"], 2)
++        self.assertEqual(self.controller.stats()["fill_failures"], 1)
++        self.assertEqual(self.controller.stats()["output_bytes"], 0)
 +
-+    def test_cache_reservation_failure_and_declined_publication_are_optional(self):
-+        for method, behavior in [("reserve_fill", RuntimeError("cache metadata unavailable")),
-+                                  ("publish_ready", False)]:
-+            with self.subTest(method=method):
-+                plan = self.plan(execution=identity(40 if method == "reserve_fill" else 41))
-+                kwargs = {"side_effect": behavior} if isinstance(behavior, Exception) else {"return_value": behavior}
-+                with mock.patch.object(self.cache, method, **kwargs):
-+                    sample = self.take(self.submit(plan))
-+                self.assertTrue(torch.equal(sample.features["aux"], features(8)["aux"]))
-+                self.assertEqual(self.cache.stats()["fill_reservations"], 0)
-+                sample.release()
-+                self.controller.poll_completed()
-+                self.controller.poll_drained()
++    def test_cache_capacity_declines_adoption_without_blocking_release(self):
++        self.cache.capacity_bytes = 64
++        sample = self.take(self.submit(self.plan()))
++        sample.release()
++        self.assertEqual(self.cache.stats()["cache_bytes"], 0)
++        self.assertEqual(self.cache.stats()["cache_adoption_skips"], 1)
++        self.assertEqual(self.controller.stats()["output_bytes"], 0)
++
++    def test_release_transfers_same_storage_without_allocating_or_copying(self):
++        sample = self.take(self.submit(self.plan(n=9)))
++        pointers = {name: tensor.untyped_storage().data_ptr() for name, tensor in sample.features.items()}
++        self.assertEqual(self.cache.stats()["cache_bytes"], 0)
++        self.assertEqual(self.controller.stats()["output_bytes"], 144)
++        original = self.cache._adopt_released_sample
++        def adopt(keys, values):
++            # The output charge remains live throughout cache admission.
++            self.assertEqual(self.controller.stats()["output_bytes"], 144)
++            return original(keys, values)
++        with mock.patch.object(self.cache, "_adopt_released_sample", adopt), \
++             mock.patch("torch.empty", side_effect=AssertionError("release allocated a tensor")), \
++             mock.patch.object(torch.Tensor, "copy_", side_effect=AssertionError("release copied a tensor")):
++            sample.release()
++        self.assertEqual(self.controller.stats()["output_bytes"], 0)
++        self.assertEqual(self.cache.stats()["cache_bytes"], 144)
++        self.assertEqual(self.cache.stats()["cache_logical_bytes"], 128)
++        self.assertEqual(self.cache.stats()["cache_owned_groups"], 1)
++        for entry in self.cache._entries.values():
++            for name, tensor in entry.features.items():
++                self.assertEqual(tensor.untyped_storage().data_ptr(), pointers[name])
++        with self.assertRaises(CaptureContractError):
++            _ = sample.features
++
++    def test_cancelled_sample_does_not_transfer_output_to_cache(self):
++        plan = self.plan()
++        sample = self.take(self.submit(plan))
++        drain = self.controller.invalidate(plan.execution, "retract after assembly")
++        self.assertFalse(drain.done())
++        sample.release()
++        self.assertTrue(drain.wait(1))
++        self.assertEqual(self.cache.stats()["cache_bytes"], 0)
++
++    def test_no_complete_chunk_does_not_retain_full_output(self):
++        sample = self.take(self.submit(self.plan(n=3)))
++        references = [weakref.ref(tensor) for tensor in sample.features.values()]
++        sample.release()
++        gc.collect()
++        self.assertEqual(self.cache.stats()["cache_bytes"], 0)
++        self.assertTrue(all(reference() is None for reference in references))
++
++    def test_workers_assemble_independent_jobs_concurrently(self):
++        gate = GateEvent()
++        first = self.submit(self.plan(execution=identity(60)), gate)
++        self.assertTrue(gate.entered.wait(3))
++        second = self.submit(self.plan(execution=identity(61)))
++        second_sample = self.take(second)
++        self.assertFalse(first.done())
++        self.assertTrue(torch.equal(second_sample.features["aux"], features(8)["aux"]))
++        gate.finished.set()
++        self.take(first)
++
++    def test_reserved_slots_are_disjoint_and_coalesce_only_after_release(self):
++        first = self.controller.try_reserve_output(identity(70), 8, 0, 0)
++        second = self.controller.try_reserve_output(identity(71), 8, 0, 0)
++        real_empty = torch.empty
++        def allocate(*args, **kwargs):
++            kwargs.pop("pin_memory", None)
++            return real_empty(*args, **kwargs)
++        with mock.patch("torch.empty", allocate):
++            a = self.controller._staging_views(8, first)
++            b = self.controller._staging_views(8, second)
++            for value in a.values():
++                value.fill_(10)
++            for value in b.values():
++                value.fill_(20)
++            self.assertTrue(all(bool(torch.all(value == 10)) for value in a.values()))
++            self.assertTrue(all(bool(torch.all(value == 20)) for value in b.values()))
++            # No reader remains when a slot is explicitly released here.
++            a.clear()
++            self.controller.release_output(first)
++            with self.assertRaises(CaptureContractError):
++                self.controller._staging_views(8, first)
++            third = self.controller.try_reserve_output(identity(72), 8, 0, 0)
++            c = self.controller._staging_views(8, third)
++            for value in c.values():
++                value.fill_(30)
++            self.assertTrue(all(bool(torch.all(value == 20)) for value in b.values()))
++            b.clear()
++            c.clear()
++        self.controller.release_output(second)
++        self.controller.release_output(third)
++        self.assertEqual(self.controller._pinned_free, [(0, 512)])
 +
 +    def test_corrupt_lease_fails_instead_of_zero_filling(self):
 +        populate(self.cache, tuple(range(8)))
