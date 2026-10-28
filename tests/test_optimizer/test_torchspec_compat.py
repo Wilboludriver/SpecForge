@@ -1,6 +1,7 @@
 import copy
 import math
 import unittest
+from unittest.mock import patch
 import torch
 from specforge.config.schema import TrainingConfig
 from specforge.optimizer import BF16Optimizer
@@ -27,7 +28,8 @@ class TorchSpecCompatibility(unittest.TestCase):
             model.weight.grad=torch.ones_like(model.weight);opt.step()
         other,restored=self.make()
         other.load_state_dict(model.state_dict())
-        restored.load_state_dict(copy.deepcopy(opt.state_dict()))
+        with patch("specforge.optimizer.print_on_rank0"):
+            restored.load_state_dict(copy.deepcopy(opt.state_dict()))
         model.weight.grad=torch.full_like(model.weight,.25)
         other.weight.grad=model.weight.grad.clone()
         opt.step();restored.step()
