@@ -14,6 +14,7 @@ def _cache_config(path: str):
             prompts_path="",
             train_data_path=path,
             max_length=4096,
+            overlength_policy="truncate",
             chat_template="llama3",
             is_preformatted=False,
             train_only_last_turn=False,
@@ -32,6 +33,12 @@ def _cache_config(path: str):
 
 
 class TestPromptCacheKey(unittest.TestCase):
+    def test_tracks_overlength_policy(self):
+        config = _cache_config("missing.jsonl")
+        before = _prompt_cache_key(config)
+        config.data.overlength_policy = "drop"
+        self.assertNotEqual(before, _prompt_cache_key(config))
+
     def test_tracks_source_content(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "prompts.jsonl")

@@ -427,6 +427,8 @@ class DataConfig(StrictConfigModel):
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
     eval_hidden_states_path: str = ""
     max_length: int = Field(default=2048, gt=0)
+    #: Drop a complete overlength native P+G record before slicing.
+    overlength_policy: Literal["truncate", "drop"] = "truncate"
     chat_template: str = "llama3"
     is_preformatted: bool = False
     train_only_last_turn: bool = False
@@ -440,6 +442,8 @@ class DataConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _exactly_one_source(self):
+        if self.overlength_policy == "drop" and not self.prompts_path:
+            raise ValueError("data.overlength_policy=drop requires native data.prompts_path")
         sources = [
             bool(self.train_data_path),
             bool(self.prompts_path),
@@ -986,7 +990,9 @@ class TrainingConfig(StrictConfigModel):
     #: Joint logits loss; independent of objective checkpointing.
     fused_logits_loss: bool = True
     learning_rate: float = Field(default=1e-4, gt=0.0)
-    lr_scheduler: Literal["cosine", "constant"] = "cosine"
+    lr_scheduler: Literal["cosine", "constant", "torchspec_cosine"] = "cosine"
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    min_lr: float = Field(default=0.0, ge=0.0)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
@@ -1078,6 +1084,10 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.min_lr > self.learning_rate:
+            raise ValueError("training.min_lr must not exceed training.learning_rate")
+        if self.min_lr and self.lr_scheduler == "constant":
+            raise ValueError("training.min_lr requires a cosine scheduler")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:
