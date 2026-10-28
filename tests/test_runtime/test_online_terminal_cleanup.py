@@ -113,6 +113,24 @@ class TerminalCleanupTests(unittest.TestCase):
         self.assertEqual(self.backend.remove_keys, [])
         self.assertEqual(len(self.backend._d), 4)
 
+    def test_terminal_uri_and_repeated_bad_proofs_are_validated_before_skip(self):
+        ref = self.ref('sample', 'token')
+        self.handoff(ref)
+        bad_uri = replace(ref, feature_store_uri='mooncake://different-store/sample')
+        with self.assertRaisesRegex(RuntimeError, 'URI identity mismatch'):
+            self.store.cleanup_terminal_refs([bad_uri], consumer_done=True, producer_closed=True)
+        self.assertEqual(self.backend.remove_keys, [])
+        self.assertIsNone(self.store._terminal_cleanup_authority)
+        self.store.cleanup_terminal_refs([ref], consumer_done=True, producer_closed=True)
+        removed = list(self.backend.remove_keys)
+        bad_generation = replace(ref, metadata={**ref.metadata, 'generation': 2})
+        bad_state = replace(ref, metadata={**ref.metadata, 'capture_fence': {
+            **ref.metadata['capture_fence'], 'state': 'DRAINING'}})
+        for bad in (bad_uri, bad_generation, bad_state):
+            with self.assertRaisesRegex(RuntimeError, 'unresolved'):
+                self.store.cleanup_terminal_refs([bad], consumer_done=True, producer_closed=True)
+        self.assertEqual(self.backend.remove_keys, removed)
+
     def test_missing_producer_eof_refuses_actual_terminal_scan(self):
         ref = self.ref('late', 'late')
         self.handoff(ref)
