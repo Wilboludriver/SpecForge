@@ -32,35 +32,79 @@ class CaptureProtocol:
         self.post = post
         self.timeout = timeout
         self.negotiated = False
+        self._capability = None
+        self._capability_known = False
+        self._capability_lock = threading.RLock()
 
     def call(self, body):
-        result = self.post(self.url, json_body={"protocol_version": 1, **body}, timeout=self.timeout)
+        try:
+            result = self.post(self.url, json_body={"protocol_version": 1, **body}, timeout=self.timeout)
+        except Exception as exc:
+            if body.get('action') != 'capability' and getattr(getattr(exc, 'response', None), 'status_code', None) == 409:
+                # Refresh discovery only. Never replay an uncertain mutation.
+                self.capability(refresh=True)
+            raise
         if not isinstance(result, dict) or result.get('error'):
             raise RuntimeError('capture control failed: ' + repr(result))
         return result
 
-    def capability(self):
+    def capability(self, *, refresh=False):
+        with self._capability_lock:
+            if self._capability_known and not refresh:
+                return dict(self._capability) if self._capability is not None else None
+            return self._discover_capability()
+
+    def invalidate_epoch(self, server_epoch):
+        if self._capability is not None and self._capability['server_epoch'] != server_epoch:
+            self.capability(refresh=True)
+
+    def _discover_capability(self):
         try:
             result = self.call({'action': 'capability'})
         except Exception as exc:
             status = getattr(getattr(exc, 'response', None), 'status_code', None)
             if status == 404 and not self.negotiated:
+                self._capability = None
+                self._capability_known = True
                 return None
             raise
         if result.get('protocol_version') != 1:
             if self.negotiated:
                 raise RuntimeError('negotiated capture protocol disappeared')
+            self._capability = None
+            self._capability_known = True
             return None
         required = ('server_epoch', 'capture_namespace', 'capture_signature', 'schema', 'cache_enabled')
         if any(name not in result for name in required):
             raise RuntimeError('incomplete capture capability')
         self.negotiated = True
-        return result
+        self._capability_known = True
+        self._capability = dict(result)
+        return dict(result)
 
     def begin(self, capability, spec, tokens, attempt_id):
+        reply = self.call({'action': 'begin', **self._begin_body(capability, spec, tokens, attempt_id)})
+        return self._begin_wire(capability, spec, attempt_id, reply)
+
+    def _begin_body(self, capability, spec, tokens, attempt_id):
+        return {**{name: spec[name] for name in ('store_id', 'sample_id', 'gen')},
+                'server_epoch': capability['server_epoch'], 'attempt_id': attempt_id,
+                'request_digest': request_digest(tokens, spec),
+                'publication_ownership': capability.get('published_ownership')}
+
+    def begin_batch(self, capability, requests):
+        if not capability.get('begin_batch'):
+            return [self.begin(capability, spec, tokens, attempt_id) for spec, tokens, attempt_id in requests]
+        tasks = [self._begin_body(capability, *request) for request in requests]
+        result = self.call({'action': 'begin_batch', 'server_epoch': capability['server_epoch'], 'tasks': tasks})
+        replies = result.get('attempts')
+        if not isinstance(replies, list) or len(replies) != len(requests):
+            raise RuntimeError('capture begin_batch count mismatch')
+        return [self._begin_wire(capability, spec, attempt_id, reply)
+                for (spec, _, attempt_id), reply in zip(requests, replies)]
+
+    def _begin_wire(self, capability, spec, attempt_id, reply):
         identity = {name: spec[name] for name in ('store_id', 'sample_id', 'gen')}
-        reply = self.call({'action': 'begin', **identity, 'server_epoch': capability['server_epoch'],
-                           'attempt_id': attempt_id, 'request_digest': request_digest(tokens, spec)})
         for name, value in {**identity, 'attempt_id': attempt_id, 'server_epoch': capability['server_epoch']}.items():
             if reply.get(name) != value:
                 raise RuntimeError('capture begin identity mismatch: ' + name)
@@ -68,7 +112,8 @@ class CaptureProtocol:
             raise RuntimeError('capture begin omitted server reservation')
         return {**identity, 'protocol_version': 1, 'server_epoch': capability['server_epoch'],
                 'attempt_id': attempt_id, 'reservation_token': reply['reservation_token'],
-                'control_url': self.url, 'timeout_s': self.timeout}
+                'control_url': self.url, 'timeout_s': self.timeout,
+                **({'object_key_layout': 'attempt-v1'} if reply.get('object_key_layout') == 'attempt-v1' else {})}
 
 
 @dataclass
@@ -78,6 +123,7 @@ class WriterFence:
     names: tuple
     post: object = http_control
     writer_drained: bool = False
+    transferred: bool = False
     removed: bool = False
     acknowledged: bool = False
     adopted: bool = False
@@ -107,6 +153,22 @@ class WriterFence:
             raise RuntimeError('capture fence identity changed')
         return result
 
+    def accept_transfer(self, certificate):
+        if certificate.get('publication_ownership') != 'attempt-v1':
+            return False
+        if self.wire.get('object_key_layout') != 'attempt-v1' or certificate.get('state') != 'PUBLISHED' or certificate.get('writer_drained') is not True:
+            raise RuntimeError('capture ownership transfer before writer drain')
+        if any(certificate.get(name) != self.wire[name] for name in
+               ('server_epoch', 'store_id', 'sample_id', 'gen', 'attempt_id', 'reservation_token')):
+            raise RuntimeError('capture ownership certificate identity mismatch')
+        expected = attempt_keys(self.wire, self.names)
+        if certificate.get('physical_keys') != expected:
+            raise RuntimeError('capture ownership certificate keys mismatch')
+        self.wire.update(publication_ownership='attempt-v1', physical_keys=expected,
+                         writer_drained=True, state='PUBLISHED')
+        self.transferred = self.writer_drained = True
+        return True
+
     def drain(self, *, cancel=True):
         if self.writer_drained:
             return
@@ -114,6 +176,7 @@ class WriterFence:
         while True:
             result = self.control('resolve', cancel=cancel)
             if result.get('writer_drained'):
+                self.accept_transfer(result.get("publication_certificate", result))
                 self.writer_drained = True
                 return
             if time.monotonic() >= deadline:
@@ -132,8 +195,10 @@ class WriterFence:
             raise RuntimeError('server did not release exact read ownership')
 
     def acquire_cleanup(self):
-        # Cached writer_drained is never permission to delete deterministic g1 keys.
+        # Only a complete immutable-key ownership certificate bypasses permits.
         self.drain(cancel=True)
+        if self.transferred:
+            return
         reply = self.control('cleanup_acquire', cleanup_owner=self.cleanup_owner)
         if reply.get('state') == 'RETIRED':
             self.remote_retired = self.removed = self.acknowledged = True
@@ -147,9 +212,18 @@ class WriterFence:
             return
         if not self.writer_drained or not self.removed:
             raise RuntimeError('cleanup acknowledgement before writer/remove drain')
+        if self.transferred:
+            self.acknowledged = True
+            return
         if not self.cleanup_token:
             raise RuntimeError('cleanup acknowledgement without server permit')
         result = self.control('cleanup_done', cleanup_token=self.cleanup_token)
         if result.get('state') != 'RETIRED':
             raise RuntimeError('capture cleanup was not retired')
         self.acknowledged = True
+
+
+def attempt_keys(wire, names):
+    """Immutable physical identity; a stale process can only address its attempt."""
+    base = f"{wire['store_id']}/{wire['sample_id']}/g{int(wire['gen'])}/attempt/{wire['server_epoch']}/{wire['reservation_token']}"
+    return {str(name): base + '/' + str(name) for name in names}

@@ -693,6 +693,7 @@ class MooncakeFeatureStore(FeatureStore):
         # frees within a run (empty in retain_on_release/offline mode); a durable
         # shared index would own this in the online multi-node follow-up.
         self._freed: set = set()
+        self._freed_capture_attempts: set = set()
         self._lock = threading.RLock()
         self._counter = 0
         self._gen_counter = 0
@@ -706,11 +707,13 @@ class MooncakeFeatureStore(FeatureStore):
         intent = {"fence": fence, "owner": owner, "token": None, "unsafe_fetch": False,
                   "handle": None, "release_requested": False, "active": True}
         with self._lock:
+            if self._capture_fences.get(ref.sample_id) is not fence or self._capture_ref_freed_locked(ref.sample_id, fence.wire):
+                raise KeyError('capture read ownership was released')
             self._capture_read_intents[owner] = intent
         # Keep intent before HTTP: lost acquire replies recover the same owner.
         try:
             with fence.lock:
-                intent["token"] = fence.acquire_read(owner)
+                intent["token"] = owner if fence.transferred else fence.acquire_read(owner)
         except BaseException as exc:
             from specforge.inference.capture_protocol import CaptureControlRejected
             intent["active"] = False
@@ -723,9 +726,10 @@ class MooncakeFeatureStore(FeatureStore):
     def _release_capture_read(self, intent):
         fence = intent["fence"]
         with fence.lock:
-            if intent["token"] is None:
-                intent["token"] = fence.acquire_read(intent["owner"])
-            fence.release_read(intent["owner"], intent["token"])
+            if not fence.transferred:
+                if intent["token"] is None:
+                    intent["token"] = fence.acquire_read(intent["owner"])
+                fence.release_read(intent["owner"], intent["token"])
         with self._lock:
             self._capture_read_intents.pop(intent["owner"], None)
             handle = intent["handle"]
@@ -736,8 +740,9 @@ class MooncakeFeatureStore(FeatureStore):
                     self._capture_handle_tokens.pop(handle.lease_token, None)
                     sid = handle.sample_id
                     if (not self.retain_on_release and self._capture_fences.get(sid) is fence
-                            and not self._still_leased_locked(sid, handle.generation)):
-                        self._freed.add((sid, handle.generation))
+                            and not self._still_leased_locked(sid, handle.generation)
+                            and not any(other["fence"] is fence for other in self._capture_read_intents.values())):
+                        self._mark_freed_locked(sid, handle.generation)
                         self._release_pending.setdefault(sid, 0)
 
     def _recover_capture_reads(self, *, require_drained=False):
@@ -769,15 +774,28 @@ class MooncakeFeatureStore(FeatureStore):
         if require_drained and failures:
             raise RuntimeError("capture read ownership not drained; permits retained: " + repr(failures))
 
-    def begin_capture_attempt(self, protocol, capability, payload, tokens, attempt_id, feature_names):
-        sid = str(payload["sample_id"])
+    def begin_capture_attempts(self, protocol, capability, requests):
+        """Record every retry identity before the one atomic begin_batch RPC."""
         with self._capture_begin_lock:
             with self._lock:
-                if sid in self._capture_pending_begin:
-                    raise RuntimeError("pending begin intent must be resolved first")
-                self._capture_pending_begin[sid] = (protocol, dict(capability), dict(payload), tuple(tokens), attempt_id, tuple(feature_names))
-            self.track_external_attempt(sid, generation=1, feature_names=list(feature_names), server_url=protocol.url.removesuffix("/spec_capture/control"))
-            return self._recover_capture_begin(sid)
+                ids = [str(payload["sample_id"]) for payload, _, _, _ in requests]
+                if len(set(ids)) != len(ids) or any(sid in self._capture_pending_begin for sid in ids):
+                    raise RuntimeError("duplicate or pending capture begin intent")
+                for payload, tokens, attempt_id, names in requests:
+                    sid = str(payload["sample_id"])
+                    self._capture_pending_begin[sid] = (protocol, dict(capability), dict(payload), tuple(tokens), attempt_id, tuple(names))
+            if not capability.get('begin_batch'):
+                return [self._recover_capture_begin(sid) for sid in ids]
+            replies = protocol.begin_batch(capability, [(payload, tokens, attempt_id) for payload, tokens, attempt_id, _ in requests])
+            for sid, wire, (_, _, _, names) in zip(ids, replies, requests):
+                self.track_capture_fence(wire, names, control_fn=protocol.post)
+                self.track_external_attempt(sid, generation=1, feature_names=list(names), server_url=protocol.url.removesuffix("/spec_capture/control"))
+                with self._lock:
+                    self._capture_pending_begin.pop(sid, None)
+            return replies
+
+    def begin_capture_attempt(self, protocol, capability, payload, tokens, attempt_id, feature_names):
+        return self.begin_capture_attempts(protocol, capability, [(payload, tokens, attempt_id, feature_names)])[0]
 
     def _recover_capture_begin(self, sid):
         with self._capture_begin_lock:
@@ -788,6 +806,7 @@ class MooncakeFeatureStore(FeatureStore):
             protocol, capability, payload, tokens, attempt_id, names = intent
             wire = protocol.begin(capability, payload, tokens, attempt_id)
             self.track_capture_fence(wire, names, control_fn=protocol.post)
+            self.track_external_attempt(sid, generation=1, feature_names=list(names), server_url=protocol.url.removesuffix("/spec_capture/control"))
             with self._lock:
                 if self._capture_pending_begin.get(sid) is intent:
                     self._capture_pending_begin.pop(sid, None)
@@ -811,6 +830,10 @@ class MooncakeFeatureStore(FeatureStore):
                 with self._lock:
                     still_current = self._capture_fences.get(sid) is fence
                 if still_current:
+                    if fence.transferred:
+                        with self._lock:
+                            if any(intent['fence'] is fence for intent in self._capture_read_intents.values()):
+                                raise RuntimeError("capture local readers or receive transfers have not drained")
                     try:
                         fence.acquire_cleanup()
                     except BaseException:
@@ -850,6 +873,8 @@ class MooncakeFeatureStore(FeatureStore):
             if any(h.sample_id == sid for h in self._active_leases.values()):
                 raise RuntimeError("capture sample has active consumer leases")
             fence = WriterFence(dict(wire), tuple(feature_names), post=control_fn or http_control)
+            if wire.get('publication_ownership') == 'attempt-v1':
+                fence.accept_transfer(wire)
             self._capture_fences[sid] = fence
             # Only a server-authorized new reservation can retire the old g1 tombstone.
             self._freed.discard((sid, 1))
@@ -864,10 +889,14 @@ class MooncakeFeatureStore(FeatureStore):
             old = self._capture_fences.get(sid)
             if old is not None and old.token != wire["reservation_token"]:
                 raise KeyError("stale capture attempt ref")
-            if old is None and (sid, int(wire["gen"])) in self._freed:
+            if old is None and self._capture_ref_freed_locked(sid, wire):
                 raise KeyError("released capture attempt ref")
         fence = self.track_capture_fence(wire, list(ref.feature_keys))
-        if validate_remote:
+        if wire.get('publication_ownership') == 'attempt-v1':
+            fence.accept_transfer(wire)
+            if ref.feature_keys != wire['physical_keys']:
+                raise RuntimeError('capture ref physical keys mismatch')
+        if validate_remote and not fence.transferred:
             status = fence.control("resolve", cancel=False)
             if status.get("state") != "PUBLISHED" or not status.get("writer_drained"):
                 from specforge.inference.capture_protocol import CaptureControlRejected
@@ -910,6 +939,8 @@ class MooncakeFeatureStore(FeatureStore):
             if any(h.sample_id == sid for h in self._active_leases.values()):
                 raise RuntimeError("cannot replace capture with active consumer lease")
             adopted_live = fence is not None and fence.adopted and sid in self._generation and sid not in self._release_pending
+        if adopted_live and fence.transferred:
+            raise RuntimeError("cannot replace an adopted live capture sample before ownership handoff")
         if adopted_live:
             with fence.lock:
                 state = fence.control("resolve", cancel=False)
@@ -930,6 +961,12 @@ class MooncakeFeatureStore(FeatureStore):
         # generation lives in the key (like SharedDirFeatureStore's filename gen):
         # a re-put writes a new-gen key set and removes the old, so a stale ref's
         # keys are gone -> get() raises (B5), no payload-carried gen needed.
+        fence = self._capture_fences.get(sample_id)
+        if fence is not None and fence.wire.get('object_key_layout') == 'attempt-v1':
+            from specforge.inference.capture_protocol import attempt_keys
+            if name not in fence.names:
+                raise KeyError("feature not owned by capture attempt")
+            return attempt_keys(fence.wire, (name,))[name]
         return f"{self.store_id}/{sample_id}/g{gen}/{name}"
 
     # -- store wrappers (status-code aware) --------------------------------
@@ -1386,7 +1423,7 @@ class MooncakeFeatureStore(FeatureStore):
         sid = sample_ref.sample_id
         ref_gen = sample_ref.metadata.get("generation")
         with self._lock:
-            if ref_gen is not None and (sid, int(ref_gen)) in self._freed:
+            if ref_gen is not None and self._capture_ref_freed_locked(sid, sample_ref.metadata.get("capture_fence") or {"gen": ref_gen}):
                 # logically freed here; the remote bytes may still linger under
                 # Mooncake's read-lease, but this ref must not resolve (B5)
                 raise KeyError(
@@ -1497,8 +1534,10 @@ class MooncakeFeatureStore(FeatureStore):
                 return False
             if fence.remote_retired:
                 return True  # Other store retired old attempt: discard LOCAL metadata only.
-            if not fence.writer_drained or not fence.cleanup_token:
+            if not fence.writer_drained or (not fence.transferred and not fence.cleanup_token):
                 return False
+        if fence is not None and fence.transferred and any(intent['fence'] is fence for intent in self._capture_read_intents.values()):
+            return False
         gen = self._generation.get(sample_id)
         if gen is None:
             return True  # nothing tracked to remove (already freed)
@@ -1551,6 +1590,9 @@ class MooncakeFeatureStore(FeatureStore):
             self._release_capture_read(intent)
             if self.retain_on_release:
                 return
+            with self._lock:
+                if expected.transferred and any(other["fence"] is expected for other in self._capture_read_intents.values()):
+                    return  # The final local reader owns the eventual deletion.
         with self._capture_cleanup_scope([handle.sample_id], expected_records={handle.sample_id: expected}):
             return self._release_impl(handle, reason=reason)
 
@@ -1573,7 +1615,7 @@ class MooncakeFeatureStore(FeatureStore):
                 return  # stale lease -> no-op
             if self._still_leased_locked(sid, cur):
                 return
-            self._freed.add((sid, handle.generation))  # immediate logical free
+            self._mark_freed_locked(sid, handle.generation)  # immediate logical free
             if self._try_physical_free(sid):
                 self._free_bookkeeping_locked(sid)
             else:
@@ -1581,6 +1623,23 @@ class MooncakeFeatureStore(FeatureStore):
                 self._release_pending.setdefault(sid, 0)
 
         self._flush_capture_acks()
+
+    def abort_ref(self, ref: SampleRef, *, reason="aborted") -> None:
+        wire = ref.metadata.get("capture_fence")
+        if wire is not None:
+            if wire.get("sample_id") != ref.sample_id or str(wire.get("store_id")) != str(self.store_id) or not wire.get("reservation_token"):
+                raise ValueError("capture cleanup ref identity mismatch")
+            self.abort(ref.sample_id, reason=reason, attempt_token=wire["reservation_token"])
+            return
+        # A legacy callback carries no authority over a later negotiated
+        # attempt. Keep the generation comparison and delete under one lock.
+        with self._lock:
+            if ref.sample_id in self._capture_fences:
+                return
+            generation = ref.metadata.get("generation")
+            if generation is None or self._generation.get(ref.sample_id) != int(generation):
+                return
+            self.abort(ref.sample_id, reason=reason)
 
     def abort(self, sample_id: str, *, reason: str = "aborted", attempt_token=None) -> None:
         with self._lock:
@@ -1612,7 +1671,7 @@ class MooncakeFeatureStore(FeatureStore):
 
             gen = self._generation.get(sample_id)
             if gen is not None:
-                self._freed.add((sample_id, gen))  # immediate logical free
+                self._mark_freed_locked(sample_id, gen)  # immediate logical free
             if self._try_physical_free(sample_id):
                 self._free_bookkeeping_locked(sample_id)
             else:
@@ -1830,6 +1889,46 @@ class MooncakeFeatureStore(FeatureStore):
             f"{preview}{detail}"
         )
 
+    def _capture_ref_freed_locked(self, sid, wire):
+        if wire.get('object_key_layout') == 'attempt-v1':
+            return (sid, wire.get('reservation_token')) in self._freed_capture_attempts
+        return (sid, int(wire['gen'])) in self._freed
+
+    def _mark_freed_locked(self, sid, generation):
+        self._freed.add((sid, generation))
+        fence = self._capture_fences.get(sid)
+        if fence is not None and fence.wire.get('object_key_layout') == 'attempt-v1':
+            self._freed_capture_attempts.add((sid, fence.token))
+
+    def _published_capture_locked(self, sample_id):
+        fence = self._capture_fences.get(sample_id)
+        return fence is not None and fence.transferred
+
+    def relinquish_published(self, ref):
+        """Disown a possibly visible ref after the streaming publisher handoff.
+
+        This drops producer metadata only. The durable ref and its designated
+        consumer/optimizer authority now own deletion of the immutable objects.
+        """
+        wire = ref.metadata.get('capture_fence') or {}
+        if wire.get('publication_ownership') != 'attempt-v1':
+            return
+        sid = ref.sample_id
+        with self._lock:
+            fence = self._capture_fences.get(sid)
+            if fence is None:
+                return
+        with fence.lock, self._lock:
+            if self._capture_fences.get(sid) is not fence or fence.token != wire.get('reservation_token'):
+                return
+            if not fence.transferred or any(h.sample_id == sid for h in self._active_leases.values()) or any(intent['fence'] is fence for intent in self._capture_read_intents.values()):
+                raise RuntimeError('cannot relinquish capture with local reader ownership')
+            self._mark_freed_locked(sid, int(wire['gen']))
+            for mapping in (self._generation, self._sample_names, self._sample_bytes, self._put_time,
+                            self._release_pending, self._capture_ack_pending, self._capture_fences):
+                mapping.pop(sid, None)
+            self._external_provisional.pop((sid, int(wire['gen'])), None)
+
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         self._recover_capture_reads()
         current = self._clock() if now is None else now
@@ -1837,7 +1936,7 @@ class MooncakeFeatureStore(FeatureStore):
             targets = set(self._release_pending) | set(self._capture_ack_pending)
             if self.max_hold_age_s is not None:
                 targets.update(sid for sid, start in self._put_time.items()
-                               if current-start > self.max_hold_age_s and not self._still_leased_locked(sid, self._generation.get(sid)))
+                               if current-start > self.max_hold_age_s and not self._published_capture_locked(sid) and not self._still_leased_locked(sid, self._generation.get(sid)))
         with self._capture_cleanup_scope(targets):
             return self._gc_impl(now=current)
 
@@ -1851,6 +1950,7 @@ class MooncakeFeatureStore(FeatureStore):
                     sid
                     for sid, t in list(self._put_time.items())
                     if now - t > self.max_hold_age_s
+                    and not self._published_capture_locked(sid)
                     and not self._still_leased_locked(sid, self._generation.get(sid))
                 ]
                 for sid in stale:

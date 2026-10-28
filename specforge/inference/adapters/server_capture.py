@@ -27,6 +27,8 @@ tensors.  The application composition root injects an algorithm-owned
 
 from __future__ import annotations
 
+from specforge.runtime.data_plane.feature_store import abort_feature_ref
+
 import json
 import logging
 import threading
@@ -334,7 +336,7 @@ class SGLangServerCaptureAdapter:
             run_id=self.run_id,
             source_task_id=task.task_id,
             feature_store_uri=f"mooncake://{result['store_id']}/{sample_id}",
-            feature_keys={n: f"{sample_id}/{n}" for n in specs},
+            feature_keys=(dict(result["physical_keys"]) if result.get("publication_ownership") == "attempt-v1" else {n: f"{sample_id}/{n}" for n in specs}),
             feature_specs=specs,
             strategy=self.strategy,
             schema_version=SCHEMA_VERSION,
@@ -365,6 +367,7 @@ class SGLangServerCaptureAdapter:
                 **{name: result[name] for name in ("server_epoch", "store_id", "sample_id", "gen", "attempt_id", "reservation_token")},
                 "protocol_version": 1, "control_url": self.base_url + "/spec_capture/control",
                 "timeout_s": self.timeout_s,
+                **{name: result[name] for name in ('object_key_layout', 'publication_ownership', 'physical_keys', 'writer_drained', 'state') if name in result},
             }
             ref.metadata["capture_diagnostics"] = {name: result.get(name) for name in
                 ("H", "L", "N", "span", "execution_epoch", "rank", "reused_tokens", "capture_namespace", "capture_signature", "timings")}
@@ -414,15 +417,17 @@ class SGLangServerCaptureAdapter:
                 raise CaptureMismatchError("server capability last hidden width mismatch")
             if requested_layers and tuple(schema.get("aux", {}).get("layer_ids", ())) != requested_layers:
                 raise CaptureMismatchError("server capability aux layer order mismatch")
+            requests = []
             for task, payload in zip(tasks, capture_payloads):
                 self.store.prepare_capture_retry(payload["sample_id"])
-                attempt_id = uuid.uuid4().hex
                 names = [*payload["features"].values(), *(x["name"] for x in payload.get("passthrough", ()))]
-                fence = self.store.begin_capture_attempt(self._capture_protocol, capability, payload, task.payload["input_ids"], attempt_id, names)
+                requests.append((payload, task.payload["input_ids"], uuid.uuid4().hex, names))
+            fences = self.store.begin_capture_attempts(self._capture_protocol, capability, requests)
+            for payload, fence in zip(capture_payloads, fences):
                 payload.update({name: capability[name] for name in ("server_epoch", "capture_namespace", "capture_signature")})
                 payload.update({name: fence[name] for name in ("protocol_version", "attempt_id", "reservation_token")})
-                names = [*payload["features"].values(), *(x["name"] for x in payload.get("passthrough", ()))]
-                self.store.track_capture_fence(fence, names, control_fn=self._capture_protocol.post)
+                if fence.get("object_key_layout") == "attempt-v1":
+                    payload["object_key_layout"] = "attempt-v1"
             if capability["cache_enabled"]:
                 body["extra_key"] = [capability["capture_namespace"]] * len(tasks)
         if self.server_capture == "plugin":
@@ -451,9 +456,14 @@ class SGLangServerCaptureAdapter:
                 feature_names=feature_names,
                 server_url=self.base_url,
             )
-        rows = self.post_fn(
-            f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
-        )
+        try:
+            rows = self.post_fn(
+                f"{self.base_url}/generate", json_body=body, timeout=self.timeout_s
+            )
+        except Exception as exc:
+            if self._capture_protocol is not None and getattr(getattr(exc, 'response', None), 'status_code', None) == 409:
+                self._capture_protocol.capability(refresh=True)
+            raise
         rows = _flatten_list_wrappers(rows)
         if len(rows) != len(tasks):
             raise RuntimeError(
@@ -516,7 +526,17 @@ class SGLangServerCaptureAdapter:
             if capability is not None:
                 for name in ("protocol_version", "server_epoch", "capture_namespace", "capture_signature", "attempt_id", "reservation_token"):
                     if result.get(name) != payload.get(name):
+                        if name == 'server_epoch':
+                            self._capture_protocol.invalidate_epoch(result.get(name))
                         raise RuntimeError("negotiated capture response identity mismatch: " + name)
+                if capability.get('published_ownership') == 'attempt-v1':
+                    if result.get('publication_ownership') != 'attempt-v1' or result.get('state') != 'PUBLISHED' or not result.get('writer_drained'):
+                        raise RuntimeError('capture response omitted drained ownership transfer')
+                    from specforge.inference.capture_protocol import attempt_keys
+                    names = [*payload['features'].values(), *(x['name'] for x in payload.get('passthrough', ()))]
+                    keys = attempt_keys(result, names)
+                    if result.get('physical_keys') != keys or any(result.get('features', {}).get(name, {}).get('key') != key for name, key in keys.items()):
+                        raise RuntimeError('capture response immutable keys mismatch')
                 if capability["cache_enabled"]:
                     N, L = len(task.payload["input_ids"]), result.get("L")
                     if not isinstance(L, int) or not 0 <= L < N or result.get("N") != N or result.get("span") != [L, N]:
@@ -533,7 +553,7 @@ class SGLangServerCaptureAdapter:
             }
             if short:
                 self.store.adopt(ref)
-                self.store.abort(ref.sample_id, reason="seq-len-mismatch")
+                abort_feature_ref(self.store, ref, reason="seq-len-mismatch")
                 out.append(
                     ServerCaptureFailure(
                         task_id=task.task_id,
@@ -573,7 +593,7 @@ class SGLangServerCaptureAdapter:
                 # Loud boundary failure; free the server-written keys so a
                 # mismatched sample is never consumable.
                 self.store.adopt(ref)
-                self.store.abort(ref.sample_id, reason=f"contract:{exc}")
+                abort_feature_ref(self.store, ref, reason=f"contract:{exc}")
                 out.append(
                     ServerCaptureFailure(
                         task_id=task.task_id, reason=str(exc), retryable=False
