@@ -690,6 +690,8 @@ class MooncakeFeatureStore(FeatureStore):
         self._capture_handle_tokens = {}
         self._capture_ack_pending = {}
         self._capture_pending_begin = {}
+        self._terminal_cleanup_authority = None
+        self._terminal_cleanup_lock = threading.RLock()
         self._capture_cleanup_local = threading.local()
         self._capture_read_local = threading.local()
         self._capture_read_intents = {}
@@ -914,6 +916,10 @@ class MooncakeFeatureStore(FeatureStore):
         if wire is None:
             return
         sid = ref.sample_id
+        if (wire.get("sample_id") != sid or str(wire.get("store_id")) != str(self.store_id)
+                or ref.metadata.get("generation") is None
+                or int(wire.get("gen", -1)) != int(ref.metadata["generation"])):
+            raise ValueError("capture ref sample/store/generation identity mismatch")
         with self._lock:
             old = self._capture_fences.get(sid)
             if old is not None and old.token != wire["reservation_token"]:
@@ -1957,6 +1963,58 @@ class MooncakeFeatureStore(FeatureStore):
                             self._release_pending, self._capture_ack_pending, self._capture_fences):
                 mapping.pop(sid, None)
             self._external_provisional.pop((sid, int(wire['gen'])), None)
+
+    def cleanup_terminal_refs(self, refs, *, consumer_done=False, producer_closed=False):
+        """Reclaim exact published attempts after both sides have finished.
+
+        Normal handoff tombstones stay sealed. A separate metadata authority
+        may adopt immutable refs only after successful consumer drain and the
+        producer's joined-worker EOF. Failure/timeout alone proves neither.
+        The authority borrows this native backend and must never close it.
+        """
+        refs = tuple(refs)
+        errors = []
+        cleaned = 0
+        with self._terminal_cleanup_lock:
+            for ref in refs:
+                wire = ref.metadata.get("capture_fence") or {}
+                immutable = (wire.get("object_key_layout") == "attempt-v1" or
+                             wire.get("publication_ownership") == "attempt-v1")
+                try:
+                    if not immutable:
+                        # Legacy cleanup retains its existing remote reader /
+                        # writer permits, even during an abnormal shutdown.
+                        self.abort_ref(ref, reason="online-attempt-finished")
+                        cleaned += 1
+                        continue
+                    if consumer_done is not True or producer_closed is not True:
+                        raise RuntimeError("terminal ownership unresolved: successful consumer_done and closed producer are required")
+                    authority = self._terminal_cleanup_authority
+                    if authority is None:
+                        authority = MooncakeFeatureStore(store_id=self.store_id, store=self._store,
+                            auth=self.auth, credential=self._credential,
+                            max_release_attempts=self.max_release_attempts)
+                        self._terminal_cleanup_authority = authority
+                    token = wire.get("reservation_token")
+                    with authority._lock:
+                        already_cleaned = ((ref.sample_id, token) in authority._freed_capture_attempts
+                                           and ref.sample_id not in authority._capture_fences)
+                    if not already_cleaned:
+                        authority.adopt(ref)  # Strict certificate + exact key validation.
+                        authority.abort_ref(ref, reason="online-attempt-finished")
+                        authority.drain_sample_removals([ref.sample_id])
+                    cleaned += 1
+                except Exception as exc:
+                    errors.append(f"{ref.sample_id}/{wire.get('reservation_token')}: {type(exc).__name__}: {exc}")
+            authority = self._terminal_cleanup_authority
+            if authority is not None and consumer_done is True and producer_closed is True:
+                try:
+                    authority.drain_pending_removals()
+                except Exception as exc:
+                    errors.append(f"terminal exact-key removal drain: {type(exc).__name__}: {exc}")
+        if errors:
+            raise RuntimeError("terminal published-ref cleanup unresolved: " + repr(errors))
+        return {"refs_cleaned": cleaned}
 
     def gc(self, *, now: Optional[float] = None) -> Dict[str, int]:
         self._recover_capture_reads()
