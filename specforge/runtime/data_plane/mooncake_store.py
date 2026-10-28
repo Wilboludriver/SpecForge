@@ -1964,6 +1964,22 @@ class MooncakeFeatureStore(FeatureStore):
                 mapping.pop(sid, None)
             self._external_provisional.pop((sid, int(wire['gen'])), None)
 
+    def _validate_terminal_capture_ref(self, ref, wire):
+        """Pure validation must precede even an already-cleaned fast return."""
+        from specforge.inference.capture_protocol import WriterFence
+
+        if (wire.get("protocol_version") != 1 or wire.get("sample_id") != ref.sample_id
+                or str(wire.get("store_id")) != str(self.store_id)
+                or int(wire.get("gen", -1)) != 1
+                or ref.metadata.get("generation") is None
+                or int(ref.metadata["generation"]) != int(wire["gen"])):
+            raise ValueError("terminal capture ref sample/store/generation identity mismatch")
+        if ref.feature_store_uri != f"mooncake://{self.store_id}/{ref.sample_id}":
+            raise ValueError("terminal capture ref canonical URI identity mismatch")
+        proof = WriterFence(dict(wire), tuple(ref.feature_keys))
+        if not proof.accept_transfer(wire) or ref.feature_keys != wire.get("physical_keys"):
+            raise ValueError("terminal capture ref certificate/physical keys mismatch")
+
     def cleanup_terminal_refs(self, refs, *, consumer_done=False, producer_closed=False):
         """Reclaim exact published attempts after both sides have finished.
 
@@ -1989,6 +2005,7 @@ class MooncakeFeatureStore(FeatureStore):
                         continue
                     if consumer_done is not True or producer_closed is not True:
                         raise RuntimeError("terminal ownership unresolved: successful consumer_done and closed producer are required")
+                    self._validate_terminal_capture_ref(ref, wire)
                     authority = self._terminal_cleanup_authority
                     if authority is None:
                         authority = MooncakeFeatureStore(store_id=self.store_id, store=self._store,
