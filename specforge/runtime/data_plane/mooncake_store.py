@@ -59,6 +59,7 @@ a tombstone-then-free protocol — a follow-up tied to the shared metadata index
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack
+from dataclasses import dataclass
 
 import logging
 import os
@@ -540,6 +541,18 @@ class ReceiveBufferPool:
             }
 
 
+@dataclass(frozen=True)
+class _CaptureBeginIntent:
+    """Stable retry identity and its batch-scoped singleflight owner."""
+    protocol: Any
+    capability: dict
+    payload: dict
+    tokens: tuple
+    attempt_id: str
+    names: tuple
+    flight: Any
+
+
 class MooncakeFeatureStore(FeatureStore):
     """A disaggregated :class:`FeatureStore` backed by the Mooncake store.
 
@@ -677,7 +690,6 @@ class MooncakeFeatureStore(FeatureStore):
         self._capture_handle_tokens = {}
         self._capture_ack_pending = {}
         self._capture_pending_begin = {}
-        self._capture_begin_lock = threading.RLock()
         self._capture_cleanup_local = threading.local()
         self._capture_read_local = threading.local()
         self._capture_read_intents = {}
@@ -775,41 +787,58 @@ class MooncakeFeatureStore(FeatureStore):
             raise RuntimeError("capture read ownership not drained; permits retained: " + repr(failures))
 
     def begin_capture_attempts(self, protocol, capability, requests):
-        """Record every retry identity before the one atomic begin_batch RPC."""
-        with self._capture_begin_lock:
+        """Reserve one batch while unrelated identities contact servers in parallel.
+
+        A flight belongs to these immutable intents, not to the shared store.
+        Recovery can wait for this exact batch without serializing other servers.
+        """
+        flight = threading.RLock()
+        # Prepare long token snapshots outside the metadata critical section.
+        intents = [(str(payload["sample_id"]), _CaptureBeginIntent(
+            protocol, dict(capability), dict(payload), tuple(tokens), attempt_id,
+            tuple(names), flight)) for payload, tokens, attempt_id, names in requests]
+        ids = [sid for sid, _ in intents]
+        with flight:
             with self._lock:
-                ids = [str(payload["sample_id"]) for payload, _, _, _ in requests]
                 if len(set(ids)) != len(ids) or any(sid in self._capture_pending_begin for sid in ids):
                     raise RuntimeError("duplicate or pending capture begin intent")
-                for payload, tokens, attempt_id, names in requests:
-                    sid = str(payload["sample_id"])
-                    self._capture_pending_begin[sid] = (protocol, dict(capability), dict(payload), tuple(tokens), attempt_id, tuple(names))
+                if any(sid in self._capture_fences or sid in self._capture_ack_pending or sid in self._release_pending for sid in ids):
+                    raise RuntimeError("prior capture attempt has not relinquished ownership")
+                self._capture_pending_begin.update(intents)
             if not capability.get('begin_batch'):
                 return [self._recover_capture_begin(sid) for sid in ids]
-            replies = protocol.begin_batch(capability, [(payload, tokens, attempt_id) for payload, tokens, attempt_id, _ in requests])
-            for sid, wire, (_, _, _, names) in zip(ids, replies, requests):
-                self.track_capture_fence(wire, names, control_fn=protocol.post)
-                self.track_external_attempt(sid, generation=1, feature_names=list(names), server_url=protocol.url.removesuffix("/spec_capture/control"))
-                with self._lock:
-                    self._capture_pending_begin.pop(sid, None)
+            replies = protocol.begin_batch(capability, [(intent.payload, intent.tokens, intent.attempt_id) for _, intent in intents])
+            for (sid, intent), wire in zip(intents, replies):
+                self._finish_capture_begin(sid, intent, wire)
             return replies
 
     def begin_capture_attempt(self, protocol, capability, payload, tokens, attempt_id, feature_names):
         return self.begin_capture_attempts(protocol, capability, [(payload, tokens, attempt_id, feature_names)])[0]
 
+    def _finish_capture_begin(self, sid, intent, wire):
+        # Caller holds intent.flight. No waiter may retarget this operation to
+        # a replacement endpoint/epoch merely because it has the same sample id.
+        with self._lock:
+            if self._capture_pending_begin.get(sid) is not intent:
+                raise RuntimeError("capture begin intent changed before completion")
+        self.track_capture_fence(wire, intent.names, control_fn=intent.protocol.post)
+        self.track_external_attempt(sid, generation=1, feature_names=list(intent.names),
+                                    server_url=intent.protocol.url.removesuffix("/spec_capture/control"))
+        with self._lock:
+            if self._capture_pending_begin.get(sid) is intent:
+                self._capture_pending_begin.pop(sid, None)
+
     def _recover_capture_begin(self, sid):
-        with self._capture_begin_lock:
+        with self._lock:
+            intent = self._capture_pending_begin.get(sid)
+        if intent is None:
+            return None  # Fresh samples never wait for another endpoint's HTTP.
+        with intent.flight:
             with self._lock:
-                intent = self._capture_pending_begin.get(sid)
-            if intent is None:
-                return None
-            protocol, capability, payload, tokens, attempt_id, names = intent
-            wire = protocol.begin(capability, payload, tokens, attempt_id)
-            self.track_capture_fence(wire, names, control_fn=protocol.post)
-            self.track_external_attempt(sid, generation=1, feature_names=list(names), server_url=protocol.url.removesuffix("/spec_capture/control"))
-            with self._lock:
-                if self._capture_pending_begin.get(sid) is intent:
-                    self._capture_pending_begin.pop(sid, None)
+                if self._capture_pending_begin.get(sid) is not intent:
+                    return None
+            wire = intent.protocol.begin(intent.capability, intent.payload, intent.tokens, intent.attempt_id)
+            self._finish_capture_begin(sid, intent, wire)
             return wire
 
     @contextmanager
