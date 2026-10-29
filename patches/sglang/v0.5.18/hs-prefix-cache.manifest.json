@@ -5,16 +5,16 @@
   "official_capture_patch_sha256": "8182e4eac902b4009f4d0314c3b6a9e71543faeac5412e3032b8741ec35537a8",
   "official_only_commit": "74be0a60ebfcc7d8e261096bca445ac51e383f03",
   "delta_patch": "hs-prefix-cache.patch",
-  "delta_sha256": "abd9e9fcc630afb6baffb539202a8381b722917702143e169f7e7f70c61891d3",
-  "source_commit": "cebcedeb15f06315104fb33fd9d35b1cf0342d13",
-  "source_tree": "dc9e7b94553e36ffc6ffb17778341a9b6f66f18d",
+  "delta_sha256": "4a0fd6f9a4ac6282e3d8066111fd3bbf4afccb7ef632bfb06f528adfad1a58e6",
+  "source_commit": "e189be978c1bfb50c463e6fd080a52fd4d111922",
+  "source_tree": "fbe147338cc67221f6fdae1d02d5ca114e7f48c6",
   "apply_order": [
     "fixed upstream",
     "unchanged official capture patch",
     "this HS delta"
   ],
-  "scope": "single server complete-sample CPU raw hidden-state prefix reuse; deterministic CUDA BF16 FA3; selected hybrid Triton FP32 recurrent pool; no generation/offload/distributed cache; Phase1 negotiated immutable attempt-v1 publication transfer, batched reservation/publication, bounded parallel CPU assembly, full-storage release-time cache adoption",
-  "validation_evidence": "implementation/real1632-perf-fix-20261028/delivery/replay-packaged-cebcede.json in the containing project",
-  "performance": "See implementation/real1632-perf-fix-20261028/delivery/REPORT.txt for actual real1632 steps11-30 results and limitations; replay alone is not performance evidence.",
-  "companion_specforge_production_commit": "07e52b51ae2dda82b70fbd80a4f6ccd2a16252d4"
+  "scope": "single server complete-sample CPU raw hidden-state prefix reuse; deterministic CUDA BF16 FA3; selected hybrid Triton FP32 recurrent pool; no generation/offload/distributed cache; Phase1 negotiated immutable attempt-v1 publication transfer, batched reservation/publication, bounded parallel CPU assembly, full-storage release-time cache adoption; coalesced Producer begin registration with independent generation and exact-attempt cancellation; scheduler-safe ready capture drain and one explicit budget-reclaim retry; existing server log content unchanged",
+  "validation_evidence": "implementation/real1632-batching-fix-20261029/delivery/replay-packaged-e189be9.json in the containing project",
+  "performance": "See implementation/real1632-batching-fix-20261029/delivery/REPORT.txt for actual real1632 128k steps11-30 comparisons and limitations; replay alone is not performance evidence.",
+  "companion_specforge_production_commit": "1185d0f72ec529836a4dd0f6c3fdba78f688e8c8"
 }

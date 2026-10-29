@@ -236,7 +236,7 @@ index 6780d91..4d9d4ea 100644
              req.swa_uuid_for_lock = result.swa_uuid_for_lock
          # match locks this node's components, so clear any stale skip set
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index 8212d4e..fbe8c8f 100644
+index 8212d4e..05c721d 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -137,6 +137,8 @@ from sglang.srt.managers.io_struct import (
@@ -351,7 +351,25 @@ index 8212d4e..fbe8c8f 100644
                  (GetInternalStateReq, self.get_internal_state),
                  (SetInternalStateReq, self.set_internal_state),
                  (RpcReqInput, self.handle_rpc_request),
-@@ -2184,6 +2215,7 @@ class Scheduler(
+@@ -1735,6 +1766,8 @@ class Scheduler(
+             if self.gracefully_exit:
+                 break
+ 
++            # Publish ready captures before receive/admission can retain their budgets.
++            self.batch_result_processor.drain_spec_captures(block=False)
+             # Receive requests
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+@@ -1779,6 +1812,8 @@ class Scheduler(
+             if self.gracefully_exit:
+                 break
+ 
++            # Keep capture output sockets and attempt ownership on Scheduler.
++            self.batch_result_processor.drain_spec_captures(block=False)
+             # Receive requests
+             recv_reqs = self.request_receiver.recv_requests()
+             self.process_input_requests(recv_reqs)
+@@ -2184,6 +2219,7 @@ class Scheduler(
              ),
              output_streamer=self.output_streamer,
              abort_request=self.abort_request,
@@ -359,7 +377,7 @@ index 8212d4e..fbe8c8f 100644
          )
  
      def init_req_max_new_tokens(self, req):
-@@ -2448,6 +2480,14 @@ class Scheduler(
+@@ -2448,6 +2484,14 @@ class Scheduler(
                  spec_capture=recv_req.spec_capture,
              )
              req.tokenizer = self.tokenizer
@@ -374,18 +392,18 @@ index 8212d4e..fbe8c8f 100644
  
              if radix_native_session:
                  req.session_generation = self.tree_cache.ensure_session_generation(
-@@ -3200,6 +3240,10 @@ class Scheduler(
+@@ -3200,6 +3244,10 @@ class Scheduler(
          prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
          running_batch: ScheduleBatch,
      ) -> Tuple[Optional[ScheduleBatch], ScheduleBatch]:
 +        bridge = self.spec_feature_bridge
++        self.batch_result_processor.drain_spec_captures(block=False)
 +        if bridge is not None and bridge.enabled:
-+            bridge.poll()
 +            bridge.phase()
          # Check if the grammar is ready in the grammar queue
          if self.grammar_manager.has_waiting_grammars():
              ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-@@ -3213,9 +3257,10 @@ class Scheduler(
+@@ -3213,9 +3261,10 @@ class Scheduler(
              # Reset batch_is_full to try preemption with a prefill adder.
              running_batch.batch_is_full = False
  
@@ -399,7 +417,7 @@ index 8212d4e..fbe8c8f 100644
              return None, running_batch
  
          running_bs = len(running_batch.reqs)
-@@ -3235,16 +3280,18 @@ class Scheduler(
+@@ -3235,16 +3284,18 @@ class Scheduler(
          # as the space for the chunked requests has just been released.
          # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
          # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
@@ -423,7 +441,7 @@ index 8212d4e..fbe8c8f 100644
  
          if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
              # If we are testing retraction and the running batch size exceeds
-@@ -3307,78 +3354,99 @@ class Scheduler(
+@@ -3307,78 +3358,103 @@ class Scheduler(
          mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
          if mamba_allocator is not None:
              mamba_allocator.alloc_group_begin(len(self.waiting_queue))
@@ -501,7 +519,11 @@ index 8212d4e..fbe8c8f 100644
 +
 +                if bridge is not None and bridge.enabled and getattr(req, "spec_feature_attempt", None) is not None:
 +                    try:
-+                        res = bridge.admit(req, adder, self.chunked_req is not None, self.truncation_align_size)
++                        res = bridge.admit_with_reclaim(
++                            req, adder, self.chunked_req is not None,
++                            self.truncation_align_size,
++                            self.batch_result_processor.drain_spec_captures,
++                        )
 +                    except Exception as exc:
 +                        bridge.invalidate_request(req, "admission-error")
 +                        req.spec_capture_result = {"sample_id": req.spec_capture.get("sample_id"), "error": str(exc)}
@@ -587,7 +609,7 @@ index 8212d4e..fbe8c8f 100644
          # Update waiting queue
          can_run_list: List[Req] = adder.can_run_list
          if len(can_run_list) == 0:
-@@ -3595,6 +3663,8 @@ class Scheduler(
+@@ -3595,6 +3671,8 @@ class Scheduler(
      def _should_copy_hidden_states_to_cpu(self, batch: ScheduleBatch) -> bool:
          from sglang.srt.spec_capture_sink import gpu_put_enabled
  
@@ -596,7 +618,7 @@ index 8212d4e..fbe8c8f 100644
          return batch.return_hidden_states and (
              (self.ps.attn_tp_rank == 0 and not gpu_put_enabled())
              or any(req.spec_capture is None for req in batch.reqs)
-@@ -3722,9 +3792,19 @@ class Scheduler(
+@@ -3722,9 +3800,19 @@ class Scheduler(
                                  )
  
                          # FIXME: pp is not compatible with overlap
@@ -616,7 +638,7 @@ index 8212d4e..fbe8c8f 100644
                          if batch.spec_algorithm.is_none():
                              self.future_map.publish(future_indices, batch.seq_lens + 1)
                          # Park any refs the worker wants kept alive 2 iters
-@@ -3838,9 +3918,19 @@ class Scheduler(
+@@ -3838,9 +3926,19 @@ class Scheduler(
                      else {}
                  )
                  resolve_forward_inputs(batch, self.future_map)
@@ -636,7 +658,7 @@ index 8212d4e..fbe8c8f 100644
                  if batch_result.has_sampled_token_ids:
                      # Non-spec: relay via future_map, gathered next iter.
                      self._relay_forward_payload(batch.req_pool_indices, batch_result)
-@@ -4521,6 +4611,12 @@ class Scheduler(
+@@ -4521,6 +4619,12 @@ class Scheduler(
          return RpcReqOutput(success=success, message="" if not exec else str(exec))
  
      def abort_request(self, recv_req: AbortReq):
@@ -650,7 +672,7 @@ index 8212d4e..fbe8c8f 100644
              if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                  self._pending_chunked_abort_req = chunked_req
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index 31defd0..e06af76 100644
+index 31defd0..1182263 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 @@ -71,6 +71,7 @@ if TYPE_CHECKING:
@@ -714,7 +736,7 @@ index 31defd0..e06af76 100644
                  return_logprob,
                  time.perf_counter(),
              )
-@@ -643,23 +659,37 @@ class SchedulerBatchResultProcessor:
+@@ -643,31 +659,54 @@ class SchedulerBatchResultProcessor:
          )
          if max_pending < 1:
              raise ValueError("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES must be >= 1")
@@ -741,22 +763,49 @@ index 31defd0..e06af76 100644
 +        if bridge is not None:
 +            bridge.poll()
          while self._spec_capture_batches:
-             if max_batches is not None and completed >= max_batches:
-                 break
-             pending, future, return_logprob, queued_at = self._spec_capture_batches[0]
--            if not block and not future.done():
+-            if max_batches is not None and completed >= max_batches:
 -                break
-+            if not future.done():
-+                if not block:
-+                    break
+-            pending, future, return_logprob, queued_at = self._spec_capture_batches[0]
+-            if not block and not future.done():
++            blocked_requests = set()
++            index = 0
++            while index < len(self._spec_capture_batches):
++                if max_batches is not None and completed >= max_batches:
++                    return completed
++                pending, future, return_logprob, queued_at = self._spec_capture_batches[index]
++                requests = {id(item[0]) for item in pending}
++                if not future.done() or requests & blocked_requests:
++                    # Independent requests may pass an unfinished batch, but
++                    # each Req must retain its own response order.
++                    blocked_requests.update(requests)
++                    index += 1
++                    continue
++                self._spec_capture_batches.pop(index)
++                self._complete_spec_capture_batch(
++                    pending,
++                    future,
++                    return_logprob=return_logprob,
++                    queued_at=queued_at,
++                )
++                completed += 1
++            if not block or (max_batches is not None and completed >= max_batches):
+                 break
+-            self._spec_capture_batches.pop(0)
+-            self._complete_spec_capture_batch(
+-                pending,
+-                future,
+-                return_logprob=return_logprob,
+-                queued_at=queued_at,
+-            )
+-            completed += 1
++            if self._spec_capture_batches:
 +                if bridge is not None:
 +                    bridge.poll()
 +                time.sleep(0.001)
-+                continue
-             self._spec_capture_batches.pop(0)
-             self._complete_spec_capture_batch(
-                 pending,
-@@ -681,6 +711,9 @@ class SchedulerBatchResultProcessor:
+         return completed
+ 
+     def _complete_spec_capture_batch(
+@@ -681,6 +720,9 @@ class SchedulerBatchResultProcessor:
                      f"{len(pending)} samples"
                  )
          except Exception as e:
@@ -1069,10 +1118,10 @@ index 2deff06..bb77dfa 100644
              logger.info(
 diff --git a/python/sglang/srt/spec_feature_bridge.py b/python/sglang/srt/spec_feature_bridge.py
 new file mode 100644
-index 0000000..39fba4c
+index 0000000..01f86b8
 --- /dev/null
 +++ b/python/sglang/srt/spec_feature_bridge.py
-@@ -0,0 +1,883 @@
+@@ -0,0 +1,908 @@
 +"""Owner-thread bridge for complete speculative capture and fenced publication.
 +
 +The cache/controller implementation lives in spec_feature_cache.  This module
@@ -1585,9 +1634,29 @@ index 0000000..39fba4c
 +        for name, value in before.items():
 +            setattr(req, name, value)
 +
++    def admit_with_reclaim(self, req, adder, has_chunked_req, truncation_align_size, reclaim):
++        result = self.admit(req, adder, has_chunked_req, truncation_align_size)
++        # This marker comes from the writer's broadcast, after full rollback on
++        # every rank. Reclamation progress is local and must not choose whether
++        # a rank enters the retry's collectives. Never retry an admitted OTHER.
++        if req.capture_budget_declined:
++            reclaim_error = None
++            try:
++                reclaim(block=False)
++            except Exception as exc:
++                reclaim_error = str(exc)
++            # Polling may fail only on the writer. Agree before any rank can
++            # enter admission's next collective, including empty error text.
++            errors = self.gather(reclaim_error)
++            if any(error is not None for error in errors):
++                raise RuntimeError("TP capture reclamation failed: " + repr(errors))
++            result = self.admit(req, adder, has_chunked_req, truncation_align_size)
++        return result
++
 +    def admit(self, req, adder, has_chunked_req, truncation_align_size):
 +        from sglang.srt.managers.schedule_policy import AddReqResult
 +        from sglang.srt.spec_feature_cache import ExecutionIdentity
++        req.capture_budget_declined = False
 +        entry = req.spec_feature_attempt
 +        if any(self.gather(entry.revoked)):
 +            self.invalidate_request(req, "rank-refused-attempt")
@@ -1602,6 +1671,7 @@ index 0000000..39fba4c
 +        before = {name: getattr(req, name, None) for name in names}
 +        lease = reservation = journal = None
 +        committed = False
++        budget_declined = False
 +        tokens = tuple(req.origin_input_ids)
 +        N = len(tokens)
 +        try:
@@ -1646,6 +1716,7 @@ index 0000000..39fba4c
 +            if reserve_error:
 +                raise ValueError(reserve_error)
 +            if not available:
++                budget_declined = True
 +                return AddReqResult.OTHER
 +            journal = AdmissionJournal(adder, req)
 +            error = None
@@ -1690,6 +1761,9 @@ index 0000000..39fba4c
 +                        self.cache.release_lease(lease)
 +                    if reservation is not None:
 +                        self.controller.release_output(reservation)
++                # Set only after every local resource and match mutation has
++                # been returned. An exception during rollback cannot authorize retry.
++                req.capture_budget_declined = budget_declined
 +
 +    def snapshot(self, batch, result):
 +        if not self.writer:
@@ -2492,10 +2566,10 @@ index 0000000..99da912
 +            }
 diff --git a/python/sglang/srt/spec_feature_cache/controller.py b/python/sglang/srt/spec_feature_cache/controller.py
 new file mode 100644
-index 0000000..6fcb589
+index 0000000..46ff01c
 --- /dev/null
 +++ b/python/sglang/srt/spec_feature_cache/controller.py
-@@ -0,0 +1,584 @@
+@@ -0,0 +1,605 @@
 +"""Bounded capture ownership, asynchronous D2H, full assembly and safe drain.
 +
 +B hands over compact independently owned suffix snapshots after admission.
@@ -2604,6 +2678,15 @@ index 0000000..6fcb589
 +        self._max_pending = max(1, min(4096, output_budget_bytes // schema.row_bytes))
 +        self._closed = False
 +        self._fill_failures = 0
++        # Admission attempts include retries; these are not unique-request counts.
++        # Reasons may overlap when more than one budget is currently exhausted.
++        self._admission_stats = dict.fromkeys((
++            "admission_attempts", "admission_reserved_attempts",
++            "admission_budget_declined_attempts", "admission_hard_oversize_attempts",
++            "admission_declined_pinned_attempts", "admission_declined_output_attempts",
++            "admission_declined_device_attempts", "admission_declined_controller_max_pending_attempts",
++            "admission_declined_fragmentation_attempts",
++        ), 0)
 +        self._adoption_calls = 0
 +        self._adoption_total_ms = self._adoption_max_ms = 0.0
 +        self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="spec-feature-capture")
@@ -2680,27 +2763,38 @@ index 0000000..6fcb589
 +        charges = {"output": N * self.schema.row_bytes + passthrough_bytes,
 +                   "pinned": self._staging_layout(N - L)[0],
 +                   "device": (N - L) * self.schema.row_bytes}
-+        for kind, amount in charges.items():
-+            if amount > self._limits[kind]:
-+                raise AdmissionBudgetError(f"request needs {amount} {kind} bytes; hard limit {self._limits[kind]}")
 +        with self._lock:
++            self._admission_stats["admission_attempts"] += 1
++            for kind, amount in charges.items():
++                if amount > self._limits[kind]:
++                    self._admission_stats["admission_hard_oversize_attempts"] += 1
++                    raise AdmissionBudgetError(f"request needs {amount} {kind} bytes; hard limit {self._limits[kind]}")
 +            if self._closed:
 +                raise CaptureContractError("capture controller is shut down")
 +            if self._arena_poisoned:
 +                raise CaptureContractError("capture staging quarantined; restart required")
 +            if execution in self._executions:
 +                raise CaptureContractError("execution identity already active; retry needs a new execution epoch")
-+            if len(self._executions) >= self._max_pending or any(
-+                    self._current[k] + charges[k] > self._limits[k] for k in charges):
++            reasons = [kind for kind in charges
++                       if self._current[kind] + charges[kind] > self._limits[kind]]
++            if len(self._executions) >= self._max_pending:
++                reasons.append("controller_max_pending")
++            if reasons:
++                self._admission_stats["admission_budget_declined_attempts"] += 1
++                for reason in reasons:
++                    self._admission_stats[f"admission_declined_{reason}_attempts"] += 1
 +                return None
 +            slot = self._allocate_slot_locked(charges["pinned"])
 +            if slot is None:
++                self._admission_stats["admission_budget_declined_attempts"] += 1
++                self._admission_stats["admission_declined_fragmentation_attempts"] += 1
 +                return None  # Fragmentation cannot authorize overlapping DMA slots.
 +            handle = OutputReservation(uuid.uuid4().hex, execution, charges["output"],
 +                                       charges["pinned"], charges["device"], N, L, passthrough_bytes)
 +            self._reservations[handle.reservation_id] = _Reservation(handle, pinned_offset=slot)
 +            state = _Execution(execution, {handle.reservation_id})
 +            self._executions[execution] = state
++            self._admission_stats["admission_reserved_attempts"] += 1
 +            for kind, amount in charges.items():
 +                self._current[kind] += amount
 +                self._peaks[kind] = max(self._peaks[kind], self._current[kind])
@@ -3049,6 +3143,7 @@ index 0000000..6fcb589
 +    def stats(self) -> dict[str, int | float]:
 +        result = self.cache.stats()
 +        with self._lock:
++            result.update(self._admission_stats)
 +            result.update({f"{k}_bytes": v for k, v in self._current.items()})
 +            result.update({f"{k}_peak_bytes": v for k, v in self._peaks.items()})
 +            result.update(pending_executions=len(self._executions),
@@ -3337,6 +3432,126 @@ index 0000000..2c6feaa
 +
 +    def wait(self, timeout: float | None = None) -> bool:
 +        return self._event.wait(timeout)
+diff --git a/test/registered/spec_feature_bridge/test_capture_reclaim.py b/test/registered/spec_feature_bridge/test_capture_reclaim.py
+new file mode 100644
+index 0000000..b35393b
+--- /dev/null
++++ b/test/registered/spec_feature_bridge/test_capture_reclaim.py
+@@ -0,0 +1,114 @@
++"""CPU scheduler regressions for independent capture completion and safe points."""
++
++import threading
++import time
++import unittest
++from concurrent.futures import Future
++from types import SimpleNamespace
++from unittest import mock
++
++from sglang.srt.managers import scheduler as scheduler_module
++from sglang.srt.managers.scheduler import Scheduler
++from sglang.srt.managers.scheduler_components.batch_result_processor import SchedulerBatchResultProcessor
++
++
++class CaptureReclaimTests(unittest.TestCase):
++    def setUp(self):
++        self.streamed = []
++        self.polls = []
++        self.scheduler_thread = threading.get_ident()
++        self.processor = object.__new__(SchedulerBatchResultProcessor)
++        object.__setattr__(self.processor, '_spec_capture_batches', [])
++        object.__setattr__(self.processor, 'spec_feature_bridge', SimpleNamespace(poll=lambda: self.polls.append(True)))
++        def stream(reqs, return_logprob):
++            self.assertEqual(threading.get_ident(), self.scheduler_thread)
++            self.streamed.extend((req.rid, req.spec_capture_result) for req in reqs)
++        object.__setattr__(self.processor, 'output_streamer', SimpleNamespace(stream_output=stream))
++
++    def queue(self, *reqs, ready=False, label=None):
++        future = Future()
++        pending = [(req, {'sample_id': req.rid}, None, None, False, 0.) for req in reqs]
++        self.processor._spec_capture_batches.append((pending, future, False, time.perf_counter()))
++        if ready:
++            future.set_result([{'label': label} for req in reqs])
++        return future
++
++    def test_ready_batch_passes_unfinished_head_and_keeps_scheduler_stream_owner(self):
++        first = SimpleNamespace(rid='first')
++        second = SimpleNamespace(rid='second')
++        head = self.queue(first)
++        self.queue(second, ready=True, label='ready')
++        self.assertEqual(self.processor.drain_spec_captures(block=False), 1)
++        self.assertEqual(self.streamed, [('second', {'label': 'ready'})])
++        self.assertEqual(len(self.processor._spec_capture_batches), 1)
++        head.set_result([{'label': 'head'}])
++        self.assertEqual(self.processor.drain_spec_captures(block=False), 1)
++        self.assertEqual([rid for rid, result in self.streamed], ['second', 'first'])
++
++    def test_same_request_and_shared_batch_response_order_is_preserved(self):
++        a, b, c = (SimpleNamespace(rid=name) for name in 'abc')
++        head = self.queue(a)
++        self.queue(a, b, ready=True, label='shared')
++        self.queue(b, ready=True, label='b-later')
++        self.queue(c, ready=True, label='independent')
++        self.assertEqual(self.processor.drain_spec_captures(), 1)
++        self.assertEqual(self.streamed, [('c', {'label': 'independent'})])
++        head.set_result([{'label': 'a-first'}])
++        self.assertEqual(self.processor.drain_spec_captures(), 3)
++        self.assertEqual(self.streamed[1:], [('a', {'label': 'a-first'}),
++                         ('a', {'label': 'shared'}), ('b', {'label': 'shared'}),
++                         ('b', {'label': 'b-later'})])
++
++    def test_cancelled_future_is_drained_without_blocking_independent_response(self):
++        head = self.queue(SimpleNamespace(rid='cancelled'))
++        self.queue(SimpleNamespace(rid='ready'), ready=True, label='ready')
++        head.cancel()
++        with self.assertLogs('sglang.srt.managers.scheduler_components.batch_result_processor', level='ERROR'):
++            self.assertEqual(self.processor.drain_spec_captures(), 2)
++        self.assertEqual(self.streamed[0][0], 'cancelled')
++        self.assertIn('error', self.streamed[0][1])
++        self.assertEqual(self.streamed[1], ('ready', {'label': 'ready'}))
++
++    def test_blocking_one_batch_reclaim_can_choose_ready_batch_past_head(self):
++        self.queue(SimpleNamespace(rid='unfinished'))
++        self.queue(SimpleNamespace(rid='ready'), ready=True, label='ready')
++        self.assertEqual(self.processor.drain_spec_captures(block=True, max_batches=1), 1)
++        self.assertEqual(self.streamed, [('ready', {'label': 'ready'})])
++
++    def test_both_event_loops_reclaim_before_receive(self):
++        for loop in (Scheduler.event_loop_normal, Scheduler.event_loop_overlap):
++            with self.subTest(loop=loop.__name__):
++                events = []
++                def drain(*, block):
++                    self.assertFalse(block)
++                    events.append('drain')
++                def receive():
++                    events.append('receive')
++                    return []
++                def process(reqs):
++                    events.append('process')
++                    state.gracefully_exit = True
++                state = SimpleNamespace(gracefully_exit=False, _engine_paused=True,
++                    batch_result_processor=SimpleNamespace(drain_spec_captures=drain),
++                    request_receiver=SimpleNamespace(recv_requests=receive), process_input_requests=process)
++                loop(state)
++                self.assertEqual(events, ['drain', 'receive', 'process'])
++
++    def test_prefill_reclaim_precedes_preserved_rank_phase(self):
++        events = []
++        bridge = SimpleNamespace(enabled=True, poll=lambda: events.append('poll'),
++            phase=lambda: events.append('phase'), any=lambda value: value)
++        state = SimpleNamespace(spec_feature_bridge=bridge,
++            batch_result_processor=SimpleNamespace(drain_spec_captures=lambda **kwargs: events.append(('drain', kwargs))),
++            grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
++            enable_hierarchical_cache=False, enable_priority_preemption=False,
++            is_hybrid_swa=False, waiting_queue=[], chunked_req=None)
++        running = SimpleNamespace(batch_is_full=False)
++        with mock.patch.object(scheduler_module, 'get_memory', return_value=SimpleNamespace(enable_flexkv=False)):
++            result = Scheduler._get_new_batch_prefill_raw(state, None, running)
++        self.assertEqual(result, (None, running))
++        self.assertEqual(events, [('drain', {'block': False}), 'phase'])
++
++
++if __name__ == '__main__':
++    unittest.main()
 diff --git a/test/registered/spec_feature_bridge/test_component_construction.py b/test/registered/spec_feature_bridge/test_component_construction.py
 new file mode 100644
 index 0000000..6c0779e
@@ -3712,19 +3927,21 @@ index 0000000..47a8bc6
 +        self.assertEqual(writer.fatal_capture_error, follower.fatal_capture_error)
 diff --git a/test/registered/spec_feature_bridge/test_runtime_integration.py b/test/registered/spec_feature_bridge/test_runtime_integration.py
 new file mode 100644
-index 0000000..1bf2e0e
+index 0000000..af25cfc
 --- /dev/null
 +++ b/test/registered/spec_feature_bridge/test_runtime_integration.py
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,294 @@
 +"""Engine bridge transactions against the actual PrefixFeatureCache/controller."""
 +import importlib.util
++import copy
 +import os
 +import pathlib
 +import sys
 +import time
++import threading
 +import types
 +import unittest
-+from concurrent.futures import Future
++from concurrent.futures import Future, ThreadPoolExecutor
 +from enum import Enum, auto
 +from unittest import mock
 +
@@ -3733,7 +3950,7 @@ index 0000000..1bf2e0e
 +# Dependency source can be A's read-only worktree before root integration.
 +if os.environ.get('SGLANG_FEATURE_CACHE_SOURCE'):
 +    sys.path.insert(0, os.environ['SGLANG_FEATURE_CACHE_SOURCE'])
-+from sglang.srt.spec_feature_cache import FeatureSpec, FeatureSchema, PrefixFeatureCache, CaptureController
++from sglang.srt.spec_feature_cache import FeatureSpec, FeatureSchema, PrefixFeatureCache, CaptureController, ExecutionIdentity
 +
 +FILE = pathlib.Path(__file__).resolve().parents[3] / 'python/sglang/srt/spec_feature_bridge.py'
 +spec = importlib.util.spec_from_file_location('sglang_bridge_runtime_test', FILE)
@@ -3822,6 +4039,154 @@ index 0000000..1bf2e0e
 +        self.assertEqual(adder.can_run_list,[])
 +        self.assertEqual(self.released,[('node','exact')])
 +        self.assertEqual(self.controller.stats()['output_bytes'],0)
++
++    def hold_output_budget(self):
++        return self.controller.try_reserve_output(
++            ExecutionIdentity('epoch', 'held', 'held', 0), 8, 0, 3904)
++
++    def test_budget_retry_runs_after_full_rollback_even_when_reclaim_returns_zero(self):
++        held = self.hold_output_budget()
++        req = self.request()
++        original_prefix = req.prefix_indices
++        adder = self.adder()
++        calls = []
++        def reclaim(*, block):
++            calls.append(block)
++            self.assertTrue(req.capture_budget_declined)
++            self.assertIs(req.prefix_indices, original_prefix)
++            self.assertEqual(req.spec_feature_limit, 0)
++            self.assertIsNone(req.extend_range)
++            self.assertEqual(adder.can_run_list, [])
++            self.assertEqual(adder.rem_input_tokens, 100)
++            self.assertEqual(self.cache.stats()['active_leases'], 0)
++            self.controller.release_output(held)
++            self.controller.poll_drained()
++            return 0
++        self.assertIs(self.owner.admit_with_reclaim(req, adder, False, None, reclaim), Result.CONTINUE)
++        self.assertEqual(calls, [False])
++        self.assertEqual(adder.can_run_list, [req])
++        self.assertFalse(req.capture_budget_declined)
++        self.assertEqual(self.controller.stats()['admission_budget_declined_attempts'], 1)
++
++    def test_budget_retry_is_limited_to_one_attempt(self):
++        held = self.hold_output_budget()
++        req = self.request()
++        adder = self.adder()
++        reclaim = mock.Mock(return_value=9)
++        self.assertIs(self.owner.admit_with_reclaim(req, adder, False, None, reclaim), Result.OTHER)
++        reclaim.assert_called_once_with(block=False)
++        self.assertTrue(req.capture_budget_declined)
++        self.assertEqual(self.controller.stats()['admission_budget_declined_attempts'], 2)
++        self.assertEqual(self.cache.stats()['active_leases'], 0)
++        self.assertEqual(adder.can_run_list, [])
++        self.controller.release_output(held)
++
++    def test_other_after_admission_and_nonbudget_rollback_never_retry(self):
++        for append in (False, True):
++            req = self.request(str(append))
++            adder = self.adder(append=append)
++            add = adder.add_one_req
++            def other(req, *args):
++                add(req, *args)
++                return Result.OTHER
++            adder.add_one_req = mock.Mock(side_effect=other)
++            reclaim = mock.Mock()
++            self.assertIs(self.owner.admit_with_reclaim(req, adder, False, None, reclaim), Result.OTHER)
++            self.assertFalse(req.capture_budget_declined)
++            adder.add_one_req.assert_called_once()
++            reclaim.assert_not_called()
++            self.assertEqual(req.spec_feature_attempt.state == 'ADMITTED', append)
++
++    def test_cancelled_attempt_does_not_reuse_stale_declined_marker(self):
++        req = self.request()
++        req.capture_budget_declined = True
++        req.spec_feature_attempt.revoked = True
++        reclaim = mock.Mock()
++        self.assertIs(self.owner.admit_with_reclaim(req, self.adder(), False, None, reclaim), Result.OTHER)
++        self.assertFalse(req.capture_budget_declined)
++        reclaim.assert_not_called()
++
++    def _check_two_rank_reclaim(self, failing_rank=None):
++        held = self.hold_output_budget()
++        writer_req = self.request()
++        peer = copy.copy(self.owner)
++        peer.writer = False
++        peer.controller = peer.cache = None
++        peer.history = []
++        peer.s = types.SimpleNamespace(ps=types.SimpleNamespace(tp_rank=1), tree_cache=self.kv)
++        peer_req = copy.copy(writer_req)
++        peer_req.spec_feature_attempt = copy.copy(writer_req.spec_feature_attempt)
++        peer_req.spec_feature_bridge = peer
++        def peer_match(tree):
++            peer_req.prefix_indices = torch.arange(min(peer_req.spec_feature_limit, 7), dtype=torch.int64)
++            peer_req.last_node = 'node'
++        peer_req.init_next_round_input = peer_match
++        barrier = threading.Barrier(2, timeout=5)
++        values = [None, None]
++        traces = [[], []]
++        def exchange(rank, kind, value):
++            traces[rank].append(kind)
++            values[rank] = (kind, value)
++            barrier.wait()
++            if values[0][0] != values[1][0]:
++                raise AssertionError('rank collective order diverged')
++            result = values[0][1] if kind == 'broadcast' else [item[1] for item in values]
++            barrier.wait()
++            return result
++        for rank, owner in enumerate((self.owner, peer)):
++            owner.broadcast = lambda value, rank=rank: exchange(rank, 'broadcast', value)
++            owner.gather = lambda value, rank=rank: exchange(rank, 'gather', value)
++        reclaim_calls = [0, 0]
++        def run(rank, owner, req):
++            adder = self.adder()
++            def reclaim(*, block):
++                self.assertFalse(block)
++                self.assertEqual(adder.can_run_list, [])
++                reclaim_calls[rank] += 1
++                if rank == failing_rank:
++                    raise RuntimeError('injected reclaim failure')
++                if rank == 0:
++                    self.controller.release_output(held)
++                    self.controller.poll_drained()
++                return rank
++            try:
++                result = owner.admit_with_reclaim(req, adder, False, None, reclaim)
++            except RuntimeError as exc:
++                if failing_rank is None:
++                    raise
++                result = exc
++            return result, adder.can_run_list
++        with ThreadPoolExecutor(max_workers=2) as workers:
++            futures = [workers.submit(run, rank, owner, req) for rank, (owner, req) in
++                       enumerate(((self.owner, writer_req), (peer, peer_req)))]
++            results = [future.result(10) for future in futures]
++        self.assertEqual(reclaim_calls, [1, 1])
++        self.assertEqual(traces[0], traces[1])
++        for (result, admitted), req in zip(results, (writer_req, peer_req)):
++            if failing_rank is None:
++                self.assertIs(result, Result.CONTINUE)
++                self.assertEqual(admitted, [req])
++                self.assertFalse(req.capture_budget_declined)
++            else:
++                self.assertIsInstance(result, RuntimeError)
++                self.assertIn('TP capture reclamation failed', str(result))
++                self.assertIn('injected reclaim failure', str(result))
++                self.assertEqual(admitted, [])
++        if failing_rank is not None:
++            self.assertEqual(str(results[0][0]), str(results[1][0]))
++            self.assertEqual(traces[0][-1], 'gather')
++            self.assertEqual(self.controller.stats()['admission_attempts'], 2)
++            self.assertEqual(self.controller.stats()['admission_budget_declined_attempts'], 1)
++            self.controller.release_output(held)
++
++    def test_two_ranks_retry_same_collectives_despite_different_reclaim_counts(self):
++        self._check_two_rank_reclaim()
++
++    def test_writer_reclaim_failure_is_agreed_before_either_rank_retries(self):
++        self._check_two_rank_reclaim(failing_rank=0)
++
++    def test_follower_reclaim_failure_is_agreed_before_either_rank_retries(self):
++        self._check_two_rank_reclaim(failing_rank=1)
 +
 +    def test_cold_and_chunk_inside_recovery_deliver_complete_actual_features(self):
 +        original={'aux':torch.arange(32,dtype=torch.float32).reshape(8,4),
@@ -4224,10 +4589,10 @@ index 0000000..7224187
 +    unittest.main()
 diff --git a/test/registered/spec_feature_cache/test_runtime.py b/test/registered/spec_feature_cache/test_runtime.py
 new file mode 100644
-index 0000000..bffc055
+index 0000000..7b3df02
 --- /dev/null
 +++ b/test/registered/spec_feature_cache/test_runtime.py
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,779 @@
 +"""CPU-only adversarial tests of the production Plan A cache/controller."""
 +
 +import gc
@@ -4629,6 +4994,52 @@ index 0000000..bffc055
 +                controller.release_output(reserved)
 +                self.assertEqual(controller.stats()["output_bytes"], 0)
 +                controller.shutdown()
++
++    def test_admission_stats_count_attempt_reasons_and_separate_hard_oversize(self):
++        for kind, limits in (('pinned', (128, 1024, 1024)),
++                             ('output', (1024, 128, 1024)),
++                             ('device', (1024, 1024, 128))):
++            with self.subTest(kind=kind):
++                controller = CaptureController(self.cache, schema(), *limits)
++                try:
++                    held = controller.try_reserve_output(identity(70), 8, 0, 0)
++                    for _ in range(2):
++                        self.assertIsNone(controller.try_reserve_output(identity(71), 4, 0, 0))
++                    with self.assertRaises(AdmissionBudgetError):
++                        controller.try_reserve_output(identity(72), 100, 0, 0)
++                    stats = controller.stats()
++                    self.assertEqual(stats['admission_attempts'], 4)
++                    self.assertEqual(stats['admission_reserved_attempts'], 1)
++                    self.assertEqual(stats['admission_budget_declined_attempts'], 2)
++                    self.assertEqual(stats[f'admission_declined_{kind}_attempts'], 2)
++                    self.assertEqual(stats['admission_hard_oversize_attempts'], 1)
++                    self.assertEqual(stats['admission_declined_controller_max_pending_attempts'], 0)
++                    controller.release_output(held)
++                finally:
++                    controller.shutdown()
++
++    def test_controller_pending_and_fragmentation_have_distinct_admission_reasons(self):
++        self.controller._max_pending = 1
++        held = self.controller.try_reserve_output(identity(80), 1, 0, 0)
++        self.assertIsNone(self.controller.try_reserve_output(identity(81), 1, 0, 0))
++        self.controller.release_output(held)
++        self.controller.poll_drained()
++        self.assertEqual(self.controller.stats()['admission_declined_controller_max_pending_attempts'], 1)
++        self.controller._max_pending = 4096
++        # Four 128-byte slots fill the 512-byte arena. Two separated free
++        # slots have enough total bytes for 192, but no contiguous DMA slot.
++        slots = [self.controller.try_reserve_output(identity(90 + i), 8, 0, 0) for i in range(4)]
++        self.controller.release_output(slots[0])
++        self.controller.release_output(slots[2])
++        self.controller.poll_drained()
++        self.assertIsNone(self.controller.try_reserve_output(identity(94), 12, 0, 0))
++        stats = self.controller.stats()
++        self.assertEqual(stats['admission_declined_fragmentation_attempts'], 1)
++        self.assertEqual(stats['admission_declined_pinned_attempts'], 0)
++        self.assertEqual(stats['admission_declined_output_attempts'], 0)
++        self.assertEqual(stats['admission_declined_device_attempts'], 0)
++        for slot in slots:
++            self.controller.release_output(slot)
 +
 +    def test_pinned_arena_is_one_retained_bounded_allocation_across_sizes(self):
 +        real_empty = torch.empty
