@@ -42,7 +42,10 @@ class CaptureProtocol:
         except Exception as exc:
             if body.get('action') != 'capability' and getattr(getattr(exc, 'response', None), 'status_code', None) == 409:
                 # Refresh discovery only. Never replay an uncertain mutation.
-                self.capability(refresh=True)
+                try:
+                    self.capability(refresh=True)
+                except Exception:
+                    pass  # Keep the original rejection recognizable to its owner.
             raise
         if not isinstance(result, dict) or result.get('error'):
             raise RuntimeError('capture control failed: ' + repr(result))

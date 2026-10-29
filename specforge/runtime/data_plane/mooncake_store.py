@@ -830,9 +830,11 @@ class MooncakeFeatureStore(FeatureStore):
             if self._capture_pending_begin.get(sid) is intent:
                 self._capture_pending_begin.pop(sid, None)
 
-    def _recover_capture_begin(self, sid):
+    def _recover_capture_begin(self, sid, *, expected_intent=None):
         with self._lock:
             intent = self._capture_pending_begin.get(sid)
+            if expected_intent is not None and intent is not expected_intent:
+                return None
         if intent is None:
             return None  # Fresh samples never wait for another endpoint's HTTP.
         with intent.flight:
@@ -965,6 +967,47 @@ class MooncakeFeatureStore(FeatureStore):
                     self._capture_ack_pending.pop(sid, None)
                 if self._capture_fences.get(sid) is fence:
                     self._capture_fences.pop(sid, None)
+
+    def discard_capture_attempt(self, sample_id, *, server_epoch, attempt_id,
+                                control_url, reservation_token=None):
+        """Retire only the original prepared writer, even after a peer retries.
+
+        An unknown begin reply can be recovered only through its matching
+        immutable intent. The captured fence then stays the cleanup authority
+        through resolve, physical removal and acknowledgement.
+        """
+        sid = str(sample_id)
+        with self._lock:
+            intent = self._capture_pending_begin.get(sid)
+            if intent is not None and not (
+                intent.protocol.url == control_url
+                and intent.capability["server_epoch"] == server_epoch
+                and intent.attempt_id == attempt_id
+            ):
+                intent = None
+        if intent is not None:
+            self._recover_capture_begin(sid, expected_intent=intent)
+        with self._lock:
+            fence = self._capture_fences.get(sid)
+            if fence is None or any(fence.wire.get(name) != value for name, value in (
+                ("server_epoch", server_epoch), ("attempt_id", attempt_id),
+                ("control_url", control_url),
+            )) or (reservation_token is not None and fence.token != reservation_token):
+                return
+            if fence.adopted and sid in self._generation and sid not in self._release_pending:
+                raise RuntimeError("cannot discard an adopted live capture attempt")
+        with self._capture_cleanup_scope([sid], expected_records={sid: fence}):
+            with self._lock:
+                if self._capture_fences.get(sid) is not fence:
+                    return
+                if fence.adopted and sid in self._generation and sid not in self._release_pending:
+                    raise RuntimeError("cannot discard an adopted live capture attempt")
+            self._abort_impl(sid, reason="capture-prepared-discard", attempt_token=fence.token)
+            self.drain_sample_removals([sid])
+        with self._lock:
+            if (self._capture_fences.get(sid) is fence
+                or self._capture_ack_pending.get(sid) is fence):
+                raise RuntimeError("prepared capture cleanup has not drained")
 
     def prepare_capture_retry(self, sample_id):
         sid = str(sample_id)
