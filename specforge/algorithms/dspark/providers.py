@@ -69,6 +69,22 @@ def resume_contract(_config, draft_model, training_model):
         ),
     }
     contract.update(dflash_attention_resume_contract(draft_model))
+    if getattr(
+        draft_model, "uses_reduced_vocab", False
+    ) or training_model.loss_type.startswith("dpace"):
+        contract.update(
+            dspark_loss_type=training_model.loss_type,
+            dspark_dpace_alpha=getattr(training_model, "dpace_alpha", None),
+            dspark_draft_vocab_size=draft_model.draft_vocab_size,
+            dspark_shared_target_model_path=getattr(
+                draft_model.config, "shared_target_model_path", None
+            ),
+            dspark_vocab_mapping_sha256=getattr(
+                draft_model.config, "vocab_mapping_sha256", None
+            ),
+            dspark_reduced_vocab_oov_policy="stop_token_loss_at_first_oov",
+            dspark_confidence_teacher_distribution="full_vocab",
+        )
     if getattr(draft_model.config, "is_causal", None) is True:
         contract["dspark_causal_block"] = True
     return contract

@@ -36,7 +36,9 @@ class AcceptRatePredictor(nn.Module):
 class VanillaMarkovHead(nn.Module):
     """Low-rank previous-token logit bias used by DSpark."""
 
-    def __init__(self, *, vocab_size: int, markov_rank: int):
+    def __init__(
+        self, *, vocab_size: int, markov_rank: int, output_vocab_size: Optional[int] = None
+    ):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.markov_rank = int(markov_rank)
@@ -44,7 +46,8 @@ class VanillaMarkovHead(nn.Module):
         if self.markov_rank <= 0:
             raise ValueError(f"markov_rank must be > 0, got {self.markov_rank}")
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.output_vocab_size = int(output_vocab_size or vocab_size)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.output_vocab_size, bias=False)
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -260,10 +263,18 @@ def build_markov_head(config, dspark_config: dict) -> Optional[nn.Module]:
         return None
 
     markov_head_type = str(dspark_config.get("markov_head_type", "vanilla")).lower()
+    output_vocab_size = int(
+        getattr(config, "draft_vocab_size", None) or config.vocab_size
+    )
+    if output_vocab_size != config.vocab_size and markov_head_type != "vanilla":
+        raise ValueError(
+            "Reduced-vocabulary DSpark currently requires a vanilla Markov head"
+        )
     if markov_head_type == "vanilla":
         return VanillaMarkovHead(
             vocab_size=config.vocab_size,
             markov_rank=markov_rank,
+            output_vocab_size=output_vocab_size,
         )
     if markov_head_type == "gated":
         return GatedMarkovHead(
@@ -326,6 +337,12 @@ class DSparkDraftModel(DFlashDraftModel):
     ) -> torch.LongTensor:
         """Generate a block with the same Markov correction used in training."""
 
+        if self.uses_reduced_vocab:
+            raise NotImplementedError(
+                "Reduced-vocabulary DSpark training is supported; this legacy "
+                "DFlash generation helper does not implement mapped DSpark verification."
+            )
+
         proposal_hidden = draft_hidden[:, -self.block_size + 1 :, :]
         base_logits = target.lm_head(proposal_hidden)
         if self.markov_head is None:
@@ -338,6 +355,19 @@ class DSparkDraftModel(DFlashDraftModel):
         return sampled_tokens
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
+        self.draft_vocab_size = int(
+            getattr(config, "draft_vocab_size", None) or config.vocab_size
+        )
+        if not 0 < self.draft_vocab_size <= config.vocab_size:
+            raise ValueError("draft_vocab_size must be in (0, vocab_size]")
+        self.uses_reduced_vocab = self.draft_vocab_size != config.vocab_size
+        if self.uses_reduced_vocab:
+            self.register_buffer(
+                "d2t", torch.zeros(self.draft_vocab_size, dtype=torch.long)
+            )
+            self.register_buffer(
+                "t2d", torch.zeros(config.vocab_size, dtype=torch.bool)
+            )
         self.markov_head = build_markov_head(config, dflash_config)
         confidence_alpha = float(dflash_config.get("confidence_head_alpha", 0.0) or 0.0)
         self.enable_confidence_head = bool(
@@ -357,6 +387,21 @@ class DSparkDraftModel(DFlashDraftModel):
             if self.confidence_head_with_markov:
                 input_dim += self.markov_head.markov_rank
             self.confidence_head = AcceptRatePredictor(input_dim=input_dim)
+
+    def validate_vocab_mapping(self) -> None:
+        """Called after checkpoint loading, before building any shared head slice."""
+        if not self.uses_reduced_vocab:
+            return
+        from specforge.core.compact_teacher import validate_vocab_mapping_consistency
+
+        if self.t2d.dtype != torch.bool or self.d2t.dtype != torch.long:
+            raise ValueError("DSpark requires bool t2d and int64 offset d2t")
+        validate_vocab_mapping_consistency(self.t2d, self.d2t)
+
+    def draft_to_target_ids(self) -> torch.Tensor:
+        if not self.uses_reduced_vocab:
+            raise ValueError("Full-vocabulary DSpark needs no token mapping")
+        return self.d2t + torch.arange(self.draft_vocab_size, device=self.d2t.device)
 
     def apply_logits_head(
         self,

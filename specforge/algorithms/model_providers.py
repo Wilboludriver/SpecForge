@@ -157,6 +157,8 @@ def _finish_registered_draft(
     draft_model: Any,
 ):
     _warm_start(cfg, draft_model, draft_config)
+    if hasattr(draft_model, "validate_vocab_mapping"):
+        draft_model.validate_vocab_mapping()
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 
@@ -438,13 +440,35 @@ def build_dspark_model(
     tokenizer: Any,
 ) -> AlgorithmModelParts:
     from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
+    from specforge.core.position_weights import DPACE_LOSS_TYPES
+
+    factory = OnlineDSparkModel
+    options = {}
+    if cfg.training.loss_type in DPACE_LOSS_TYPES:
+        from specforge.algorithms.dspark.dpace import OnlineDSparkDpaceModel
+
+        factory = OnlineDSparkDpaceModel
+        options = dict(
+            loss_type=cfg.training.loss_type, dpace_alpha=cfg.training.dpace_alpha
+        )
+    elif getattr(draft_model, "uses_reduced_vocab", False):
+        raise ValueError("Reduced-vocabulary DSpark requires a D-PACE loss_type")
+    expected_target = getattr(draft_model.config, "shared_target_model_path", None)
+    if expected_target:
+        from pathlib import Path
+
+        if Path(expected_target).resolve() != Path(cfg.model.target_model_path).resolve():
+            raise ValueError(
+                "This draft must use its configured business target embedding/head"
+            )
 
     return _build_dflash_family_model(
         cfg,
         draft_model,
         tokenizer,
-        lambda common: OnlineDSparkModel(
+        lambda common: factory(
             **common,
+            **options,
             dspark_ce_loss_alpha=cfg.training.dspark_ce_loss_alpha,
             dspark_l1_loss_alpha=cfg.training.dspark_l1_loss_alpha,
             fused_logits_loss=cfg.training.fused_logits_loss,
