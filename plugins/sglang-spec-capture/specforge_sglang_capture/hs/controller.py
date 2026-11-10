@@ -14,6 +14,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from time import monotonic_ns, perf_counter
 from dataclasses import dataclass, field
+from typing import Callable
 
 import torch
 
@@ -63,6 +64,7 @@ class _Job:
     state: _Execution
     future: Future
     diagnostics: dict[str, int | float] = field(default_factory=dict)
+    before_copy_wait: Callable[[], None] | None = None
 
 
 class _UnsafeDrain(RuntimeError):
@@ -82,6 +84,7 @@ class CaptureController:
         if not isinstance(cache, PrefixFeatureCache) or schema != cache.schema:
             raise CaptureContractError("controller/cache schema mismatch")
         self.cache, self.schema = cache, schema
+        self._overlap_prefix_copy = os.environ.get("SPECFORGE_HS_OVERLAP_PREFIX_COPY", "0") == "1"
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
         self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
         self._diagnostic_limit = max(0, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_MAX", "4096")))
@@ -445,6 +448,12 @@ class CaptureController:
                         source.record_stream(stream)
                     copied = torch.cuda.Event(enable_timing=True) if job.diagnostics else torch.cuda.Event()
                     copied.record(stream)
+                # Only independent CPU output/prefix work may overlap this DMA.
+                # Stay inside the dual-owner drain guard if that work fails.
+                before_wait, job.before_copy_wait = job.before_copy_wait, None
+                if before_wait is not None:
+                    before_wait()
+                before_wait = None
                 copied.synchronize()
                 if job.diagnostics:
                     # Read events only after the existing real copy drain. No
@@ -489,19 +498,13 @@ class CaptureController:
         sample = None
         completion = None
         unsafe = False
-        try:
-            if job.diagnostics:
-                started_ns = monotonic_ns()
-                job.diagnostics["p0_v1_materialize_started_ns"] = started_ns
-                job.diagnostics["p0_v1_d2h_queue_ms"] = (started_ns - job.diagnostics["p0_v1_materialize_submitted_ns"]) / 1e6
-                job.diagnostics["p0_v1_d2h_bytes"] = (job.plan.N - job.plan.L) * self.schema.row_bytes if job.is_cuda else 0
-            copy_started = perf_counter()
-            staging = self._copy_suffix(job)
-            copied_at = perf_counter()
-            job.features.clear()
-            job.ready_event = None
+        prepared = overlap_used = False
+        overlap_timings = {}
+
+        def prepare_output():
+            nonlocal prepared
             if self._cancelled(job):
-                raise CaptureCancelledError(job.state.reason or "execution released")
+                return
             with torch.no_grad():
                 if job.diagnostics:
                     alloc_started = monotonic_ns()
@@ -516,12 +519,48 @@ class CaptureController:
                 try:
                     self.cache.copy_prefix_into(job.plan.lease, job.plan.L, output)
                 finally:
+                    # CPU prefix reads are synchronous. Their real reader has
+                    # ended; DMA still owns the separate staging arena/sources.
                     self.cache.release_lease(job.plan.lease)
                 if job.diagnostics:
-                    suffix_started = monotonic_ns()
-                    job.diagnostics["p0_v1_prefix_copy_ms"] = (suffix_started - prefix_started) / 1e6
+                    job.diagnostics["p0_v1_prefix_copy_ms"] = (monotonic_ns() - prefix_started) / 1e6
                     job.diagnostics["p0_v1_prefix_copy_bytes"] = job.plan.L * self.schema.row_bytes
                     job.diagnostics["p0_v1_prefix_copy_minor_faults"] = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt - faults_started
+            prepared = True
+
+        def overlap_prefix():
+            nonlocal overlap_used
+            overlap_used = True
+            overlap_timings["p3_v1_before_wait_started_ns"] = monotonic_ns()
+            prepare_output()
+            overlap_timings["p3_v1_prefix_done_ns"] = monotonic_ns()
+
+        try:
+            if job.diagnostics:
+                started_ns = monotonic_ns()
+                job.diagnostics["p0_v1_materialize_started_ns"] = started_ns
+                job.diagnostics["p0_v1_d2h_queue_ms"] = (started_ns - job.diagnostics["p0_v1_materialize_submitted_ns"]) / 1e6
+                job.diagnostics["p0_v1_d2h_bytes"] = (job.plan.N - job.plan.L) * self.schema.row_bytes if job.is_cuda else 0
+            copy_started = perf_counter()
+            if self._overlap_prefix_copy:
+                job.before_copy_wait = overlap_prefix
+            staging = self._copy_suffix(job)
+            job.before_copy_wait = None
+            copied_at = perf_counter()
+            if overlap_used:
+                overlap_timings["p3_v1_drain_done_ns"] = monotonic_ns()
+                overlap_timings["p3_v1_residual_wait_ms"] = (overlap_timings["p3_v1_drain_done_ns"] - overlap_timings["p3_v1_prefix_done_ns"]) / 1e6
+            job.features.clear()
+            job.ready_event = None
+            if self._cancelled(job):
+                raise CaptureCancelledError(job.state.reason or "execution released")
+            if not prepared:
+                prepare_output()
+            if self._cancelled(job):
+                raise CaptureCancelledError(job.state.reason or "execution released")
+            with torch.no_grad():
+                if job.diagnostics:
+                    suffix_started = monotonic_ns()
                     faults_started = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
                 for name in output:
                     output[name][job.plan.L:job.plan.N].copy_(staging[name])
@@ -543,11 +582,21 @@ class CaptureController:
                 # Assembly and key preparation are complete. Sample/completion
                 # bookkeeping and future delivery follow on this same worker.
                 job.diagnostics["p0_v1_materialize_done_ns"] = monotonic_ns()
+            if overlap_used:
+                # Do not silently redefine legacy d2h_wait/assembly: CPU prefix
+                # work now occurs inside the copy-drain span. These v3 host
+                # intervals are not a claim of GPU critical-path savings.
+                stage_timings = {"p3_v1_timing_schema_version": 3,
+                    "p3_v1_copy_and_prefix_ms": (copied_at - copy_started) * 1000.0,
+                    "p3_v1_post_drain_assembly_ms": (assembled_at - copied_at) * 1000.0,
+                    **overlap_timings}
+            else:
+                stage_timings = {"d2h_wait_ms": (copied_at - copy_started) * 1000.0,
+                    "assembly_ms": (assembled_at - copied_at) * 1000.0}
             sample = MaterializedSample(job.plan.execution, output, job.plan.N,
                         lambda: self._sample_released(job.plan.reservation), timings={
                             **job.diagnostics,
-                            "d2h_wait_ms": (copied_at - copy_started) * 1000.0,
-                            "assembly_ms": (assembled_at - copied_at) * 1000.0,
+                            **stage_timings,
                             "cache_fill_ms": (filled_at - assembled_at) * 1000.0,
                         })
             with self._lock:
@@ -573,6 +622,7 @@ class CaptureController:
         except BaseException as exc:
             completion = CaptureCompletion(job.plan.execution, error=_normalized_error(exc))
         finally:
+            job.before_copy_wait = None
             self.cache.release_lease(job.plan.lease)
             output.clear()
             if not unsafe:
