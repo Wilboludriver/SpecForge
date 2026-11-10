@@ -525,6 +525,8 @@ class SpecCaptureSink:
         """
         if self._closed:
             raise RuntimeError("capture sink is closed")
+        if self._uncertain_snapshot():
+            raise RuntimeError("capture sink is quarantined; publication not accepted")
         # Own a separate list: the caller may still be assigning completions
         # while this worker finishes and drops its last source references.
         diagnostic = None

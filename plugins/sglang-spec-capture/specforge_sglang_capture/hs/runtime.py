@@ -64,6 +64,7 @@ class _Publication:
     failed: BaseException | None = None
     publish_started: float = 0.0
     diagnostic: dict | None = None
+    publication_ticket: Any = None
 
 
 class HSCompletion:
@@ -147,7 +148,7 @@ class HSCaptureRuntime:
 
         signature = self._local_phase("startup.identity", identify)
         self._agree("startup.signature", signature)
-        self.cache = self.controller = None
+        self.cache = self.controller = self.publication_lane = None
 
         def create_core():
             if self.writer:
@@ -156,10 +157,21 @@ class HSCaptureRuntime:
                 self.controller = CaptureController(
                     self.cache, schema, config.pinned_bytes, config.output_bytes,
                     config.device_bytes, max_workers=config.max_workers)
+                if os.environ.get("SPECFORGE_HS_BACKGROUND_PUBLISH", "0") == "1":
+                    from .publication import PublicationLane
+                    tickets = int(os.environ.get("SPECFORGE_HS_PUBLISH_TICKETS", "8"))
+                    self.publication_lane = PublicationLane(self.capture.sink,
+                        max_tickets=tickets,
+                        max_bytes=min(config.output_bytes, int(os.environ.get(
+                            "SPECFORGE_HS_PUBLISH_BYTES", str(config.output_bytes)))),
+                        batch_samples=min(tickets, int(os.environ.get("SPECFORGE_HS_PUBLISH_BATCH", "8"))),
+                        batch_wait_ms=float(os.environ.get("SPECFORGE_HS_PUBLISH_WAIT_MS", "1")))
 
         try:
             self._local_phase("startup.core", create_core)
         except Exception:
+            if self.publication_lane is not None:
+                self.publication_lane.close()
             if self.controller is not None:
                 self.controller.shutdown(wait=True)
             raise
@@ -561,6 +573,8 @@ class HSCaptureRuntime:
     def _cancel_job(self, job, reason, *, revoke=True):
         if job.entry.transfer_certificate:
             return
+        if job.publication_ticket is not None:
+            self.publication_lane.revoke(job.publication_ticket)
         if revoke:
             job.entry.revoked, job.entry.state = True, "DRAINING"
         if job.failed is None:
@@ -640,6 +654,11 @@ class HSCaptureRuntime:
                 self.capture.results[req.rid] = {"sample_id": job.spec["sample_id"],
                                                 "error": "capture requests must finish at prefill"}
                 continue
+            if not job.consumed and self.publication_lane is not None:
+                job.publication_ticket = self.publication_lane.try_attach(
+                    job.execution, job.spec, job.materialize, job.plan.reservation.host_bytes)
+                if job.diagnostic is not None:
+                    job.diagnostic["p0_v1_publication_lane"] = job.publication_ticket is not None
             job.consumed = True
             self.capture.defer_response(req, HSCompletion(self, job))
         self.poll()
@@ -650,9 +669,11 @@ class HSCaptureRuntime:
         if entry is not None:
             self.invalidate(entry, reason)
 
-    def _drop_job(self, job):
+    def _drop_job(self, job, *, retain_ticket=False):
         if self.jobs.get(job.execution) is not job:
             return
+        if job.publication_ticket is not None and not retain_ticket:
+            self.publication_lane.acknowledge(job.publication_ticket)
         self.jobs.pop(job.execution)
         job.entry.deliveries -= 1
         if job.entry.deliveries < 0:
@@ -697,6 +718,16 @@ class HSCaptureRuntime:
             raise CaptureContractError("capture sink auxiliary layer order mismatch")
         return keys
 
+    def _accept_sink(self, job, future, index, count, enqueue_ns, started):
+        job.sink, job.sink_index, job.sink_count = future, index, count
+        job.publish_started = started
+        if job.diagnostic is not None:
+            job.diagnostic["p0_v1_runtime_sink_enqueue_ns"] = enqueue_ns
+            done_ns = job.sample.timings.get("p0_v1_materialize_done_ns")
+            if done_ns is not None:
+                job.diagnostic["p0_v1_materialize_to_enqueue_ms"] = (enqueue_ns - done_ns) / 1e6
+        job.entry.state = "PUBLISHING"
+
     def poll(self, scheduler=None):
         """Progress independent jobs and batch only currently ready publications."""
         self._assert_owner()
@@ -704,6 +735,8 @@ class HSCaptureRuntime:
             return
         self.controller.poll_completed()
         self.controller.poll_drained()
+        if self.publication_lane is not None and self.publication_lane.poisoned():
+            self.fatal_capture_error = "capture publication drain unknown; buffers and budgets retained"
 
         ready = []
         for job in tuple(self.jobs.values()):
@@ -720,9 +753,20 @@ class HSCaptureRuntime:
                 continue
             if job.sink is not None or not job.materialize.done():
                 continue
+            handback = None
+            if job.publication_ticket is not None:
+                handback = self.publication_lane.observe(job.publication_ticket)
+                if handback is None:
+                    continue
             try:
                 if job.sample is None:
                     job.sample = job.materialize.result()
+                if handback is not None:
+                    if handback.sink is not None:
+                        self._accept_sink(job, handback.sink, handback.index, handback.count,
+                                          handback.enqueue_ns, handback.publish_started)
+                        continue
+                    raise handback.error or RuntimeError("publication handback has no writer")
                 if job.failed is not None or not self._current(job):
                     raise job.failed or RuntimeError("capture execution invalidated")
                 if self.fatal_capture_error:
@@ -742,14 +786,7 @@ class HSCaptureRuntime:
                 future = Future()
                 future.set_exception(scalar_error(exc))
             for index, job in enumerate(ready):
-                job.sink, job.sink_index, job.sink_count = future, index, len(ready)
-                job.publish_started = time.perf_counter()
-                if job.diagnostic is not None:
-                    job.diagnostic["p0_v1_runtime_sink_enqueue_ns"] = enqueue_ns
-                    done_ns = job.sample.timings.get("p0_v1_materialize_done_ns")
-                    if done_ns is not None:
-                        job.diagnostic["p0_v1_materialize_to_enqueue_ms"] = (enqueue_ns - done_ns) / 1e6
-                job.entry.state = "PUBLISHING"
+                self._accept_sink(job, future, index, len(ready), enqueue_ns, time.perf_counter())
             samples = None  # The sink now owns and clears its argument list.
         ready.clear()
         for job in tuple(self.jobs.values()):
@@ -813,7 +850,7 @@ class HSCaptureRuntime:
                     self.fatal_capture_error = "capture publication drain unknown; buffers and budgets retained"
                     if not job.output.done():
                         job.output.set_exception(scalar_error(exc))
-                    self._drop_job(job)
+                    self._drop_job(job, retain_ticket=True)
                 else:
                     self._finish_error(job, exc)
         for entry in self.registry.active.values():
@@ -837,6 +874,8 @@ class HSCaptureRuntime:
             self.poll()
             if self.jobs:
                 time.sleep(0.001)
+        if self.publication_lane is not None:
+            self.publication_lane.close()
         if self.quarantined_snapshots or self.quarantined_publications:
             raise RuntimeError("HS shutdown retains quarantined storage; native drain is unproven")
         if self.controller:
@@ -917,6 +956,7 @@ class HSCaptureRuntime:
                             "p0_v1_diagnostic_seen": self._diagnostic_sequence,
                             "p0_v1_diagnostic_every": self._diagnostic_every,
                             "p0_v1_diagnostic_limit": self._diagnostic_limit} if self._diagnostics else {}),
+                        "publication_lane": self.publication_lane.stats() if self.publication_lane else {},
                         "cache": self.cache.stats() if self.cache else {},
                         "controller": self.controller.stats() if self.controller else {}}
             return self._local_phase("control.stats", stats)
