@@ -66,7 +66,8 @@ class PublicationLane:
         self._closing = self._poisoned = False
         self._inflight = None
         self._counts = dict(attached=0, fallback=0, batches=0, samples=0,
-                            max_live_tickets=0, max_live_bytes=0)
+                            max_live_tickets=0, max_live_bytes=0, aggregation_wait_count=0,
+                            aggregation_wait_ms_total=0.0, aggregation_wait_ms_max=0.0)
         self._thread = threading.Thread(target=self._run,
             name="hs-publication-lane", daemon=True)
         try:
@@ -86,6 +87,8 @@ class PublicationLane:
     def try_attach(self, execution, spec, materialize, host_bytes):
         # Main calls once, only after consume authorization. An unsuccessful
         # attach permanently selects the original main-poll publication owner.
+        if not isinstance(host_bytes, int) or host_bytes <= 0:
+            raise ValueError("publication role bytes must be positive")
         with self._condition:
             if (self._closing or self._poisoned or len(self._tickets) >= self._max_tickets
                     or host_bytes > self._max_bytes - self._bytes):
@@ -176,13 +179,14 @@ class PublicationLane:
                     selected.append(ticket)
                 except BaseException as exc:
                     failures[ticket] = Handback(error=scalar_error(exc))
-            enqueue_ns, started = time.monotonic_ns(), time.perf_counter()
+            enqueue_ns = time.monotonic_ns()
             if selected:
                 try:
                     future = self._sink.submit_samples(samples)
                 except BaseException as exc:
                     future = Future()
                     future.set_exception(scalar_error(exc))
+                started = time.perf_counter()  # Legacy queue interval starts after submit returns.
                 for index, ticket in enumerate(selected):
                     failures[ticket] = Handback(future, index, len(selected), enqueue_ns, started)
                 return failures, future, len(selected)
@@ -213,7 +217,13 @@ class PublicationLane:
                         # At most one bounded aggregation wait per batch. This
                         # may admit newly ready siblings; it never waits for all.
                         if self._batch_wait:
+                            waiting = time.monotonic_ns()
                             self._condition.wait(self._batch_wait)
+                            elapsed = (time.monotonic_ns() - waiting) / 1e6
+                            self._counts["aggregation_wait_count"] += 1
+                            self._counts["aggregation_wait_ms_total"] += elapsed
+                            self._counts["aggregation_wait_ms_max"] = max(
+                                self._counts["aggregation_wait_ms_max"], elapsed)
                         if self._closing:
                             return
                         ready = [ticket for ticket in self._tickets

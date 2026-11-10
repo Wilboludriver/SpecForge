@@ -241,6 +241,21 @@ class BackgroundPublicationTests(unittest.TestCase):
         self.assertEqual(hs.controller.stats()["output_bytes"], 0)
         self.assertEqual(hs.publication_lane.stats()["live_tickets"], 0)
 
+    def test_role_byte_limit_is_independent_of_ticket_count(self):
+        lane = PublicationLane(object(), max_tickets=4, max_bytes=100, batch_samples=4)
+        try:
+            ticket = lane.try_attach(1, {}, Future(), 60)
+            self.assertIsNotNone(ticket)
+            self.assertIsNone(lane.try_attach(2, {}, Future(), 41))
+            self.assertEqual(lane.stats()["live_tickets"], 1)
+            self.assertEqual(lane.stats()["live_role_bytes"], 60)
+            lane.revoke(ticket)
+            self.assertEqual(lane.stats()["live_role_bytes"], 60)
+            lane.acknowledge(ticket)
+            self.assertEqual(lane.stats()["live_role_bytes"], 0)
+        finally:
+            lane.close()
+
     def test_lane_coalesces_ready_siblings_and_freezes_spec(self):
         class Sink:
             def __init__(self):

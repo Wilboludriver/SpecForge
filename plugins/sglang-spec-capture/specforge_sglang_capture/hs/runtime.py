@@ -654,12 +654,13 @@ class HSCaptureRuntime:
                 self.capture.results[req.rid] = {"sample_id": job.spec["sample_id"],
                                                 "error": "capture requests must finish at prefill"}
                 continue
-            if not job.consumed and self.publication_lane is not None:
+            already_consumed = job.consumed
+            job.consumed = True
+            if not already_consumed and self.publication_lane is not None:
                 job.publication_ticket = self.publication_lane.try_attach(
                     job.execution, job.spec, job.materialize, job.plan.reservation.host_bytes)
                 if job.diagnostic is not None:
                     job.diagnostic["p0_v1_publication_lane"] = job.publication_ticket is not None
-            job.consumed = True
             self.capture.defer_response(req, HSCompletion(self, job))
         self.poll()
 
