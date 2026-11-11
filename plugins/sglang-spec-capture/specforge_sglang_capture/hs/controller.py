@@ -82,6 +82,20 @@ class CaptureController:
         if not isinstance(cache, PrefixFeatureCache) or schema != cache.schema:
             raise CaptureContractError("controller/cache schema mismatch")
         self.cache, self.schema = cache, schema
+        coalesce = os.environ.get("SPECFORGE_HS_COALESCE_OUTPUT", "0")
+        if coalesce not in ("0", "1"):
+            raise CaptureContractError("SPECFORGE_HS_COALESCE_OUTPUT must be 0 or 1")
+        self._coalesce_output = coalesce == "1"
+        self._coalesce_output_eligible = (len(schema.features) > 1
+                                          and len({f.dtype for f in schema.features}) == 1)
+        # Fixed-cardinality, allocation-only counters; no per-sample references.
+        self._output_allocation_stats = dict.fromkeys((
+            "output_alloc_requests", "output_alloc_completed_samples",
+            "output_alloc_empty_attempts", "output_alloc_completed_storage_bytes",
+            "output_alloc_failed_requests", "output_coalesce_applied_samples",
+            "output_coalesce_allocations_saved", "output_coalesce_fallback_disabled_samples",
+            "output_coalesce_fallback_mixed_dtype_samples", "output_coalesce_fallback_single_feature_samples",
+        ), 0)
         self._diagnostics = os.environ.get("SPECFORGE_HS_DIAGNOSTICS", "0") == "1"
         self._diagnostic_every = max(1, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_EVERY", "1")))
         self._diagnostic_limit = max(0, int(os.environ.get("SPECFORGE_HS_DIAGNOSTICS_MAX", "4096")))
@@ -126,6 +140,58 @@ class CaptureController:
         self._adoption_unused_skips = 0
         self._adoption_total_ms = self._adoption_max_ms = 0.0
         self._executor = ThreadPoolExecutor(max_workers=self._max_workers, thread_name_prefix="spec-feature-capture")
+
+    def _allocate_output(self, rows):
+        """Return only complete feature views; no worker-local backing alias.
+
+        Homogeneous features occupy disjoint contiguous regions of one exact
+        storage. Mixed dtypes retain the original independent allocations.
+        Normalize helper errors before they can retain a partial backing/view.
+        """
+        checked_int(rows, "output rows")
+        output, backing = {}, None
+        attempts = 0
+        failure = None
+        applied = self._coalesce_output and self._coalesce_output_eligible
+        try:
+            if applied:
+                width = sum(spec.width for spec in self.schema.features)
+                attempts += 1
+                backing = torch.empty((rows * width,), dtype=DTYPES[self.schema.features[0].dtype], device="cpu")
+                offset = 0
+                for spec in self.schema.features:
+                    count = rows * spec.width
+                    output[spec.name] = backing.narrow(0, offset, count).view(rows, spec.width)
+                    offset += count
+            else:
+                for spec in self.schema.features:
+                    attempts += 1
+                    output[spec.name] = torch.empty((rows, spec.width), dtype=DTYPES[spec.dtype], device="cpu")
+        except BaseException as exc:
+            failure = _normalized_error(exc)
+        # Even a failed view construction must drop the master before release.
+        backing = None
+        if failure is not None:
+            output.clear()
+        with self._lock:
+            stats = self._output_allocation_stats
+            stats["output_alloc_requests"] += 1
+            stats["output_alloc_empty_attempts"] += attempts
+            if failure is not None:
+                stats["output_alloc_failed_requests"] += 1
+            else:
+                stats["output_alloc_completed_samples"] += 1
+                stats["output_alloc_completed_storage_bytes"] += rows * self.schema.row_bytes
+                if applied:
+                    stats["output_coalesce_applied_samples"] += 1
+                    stats["output_coalesce_allocations_saved"] += len(self.schema.features) - 1
+                else:
+                    reason = ("disabled" if not self._coalesce_output else
+                              "single_feature" if len(self.schema.features) == 1 else "mixed_dtype")
+                    stats[f"output_coalesce_fallback_{reason}_samples"] += 1
+        if failure is not None:
+            raise failure from None
+        return output
 
     def _staging_layout(self, rows):
         offset, layout = 0, {}
@@ -506,8 +572,7 @@ class CaptureController:
                 if job.diagnostics:
                     alloc_started = monotonic_ns()
                     faults_started = resource.getrusage(resource.RUSAGE_THREAD).ru_minflt
-                for spec in self.schema.features:
-                    output[spec.name] = torch.empty((job.plan.N, spec.width), dtype=DTYPES[spec.dtype], device="cpu")
+                output = self._allocate_output(job.plan.N)
                 if job.diagnostics:
                     prefix_started = monotonic_ns()
                     job.diagnostics["p0_v1_output_alloc_ms"] = (prefix_started - alloc_started) / 1e6
@@ -639,6 +704,9 @@ class CaptureController:
         result = self.cache.stats()
         with self._lock:
             result.update(self._admission_stats)
+            result.update(self._output_allocation_stats)
+            result.update(output_coalesce_enabled=int(self._coalesce_output),
+                          output_coalesce_schema_eligible=int(self._coalesce_output_eligible))
             result.update({f"{k}_bytes": v for k, v in self._current.items()})
             result.update({f"{k}_peak_bytes": v for k, v in self._peaks.items()})
             result.update(pending_executions=len(self._executions),
