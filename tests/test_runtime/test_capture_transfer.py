@@ -83,6 +83,13 @@ class TransferTests(unittest.TestCase):
             consumer.drain_pending_removals(retry_interval_s=0)
         self.assertEqual(before, self.server.calls)
 
+    def test_ref_length_matches_the_registered_input(self):
+        tasks = [_task(0, 5), _task(1, 7), _task(2, 9)]
+        tasks[0].metadata["num_tokens"] = 99
+        tasks[1].metadata["num_tokens"] = 0
+        refs = self.adapter.produce_refs(tasks, capture=_eagle3_contract())
+        self.assertEqual([ref.num_tokens for ref in refs], [5, 7, 9])
+
     def test_multiple_readers_defer_local_remove(self):
         ref = self.produce(0)[0]
         _, first = self.producer.get(ref)

@@ -389,9 +389,6 @@ class SGLangServerCaptureAdapter:
                     }
             specs[name] = FeatureSpec(name=name, shape=shape, dtype=dtype, **extra)
             nbytes += _spec_nbytes(shape, dtype)
-        num_tokens = int(task.metadata.get("num_tokens", 0)) or len(
-            task.payload["input_ids"]
-        )
         ref = SampleRef(
             sample_id=sample_id,
             run_id=self.run_id,
@@ -403,7 +400,7 @@ class SGLangServerCaptureAdapter:
             schema_version=SCHEMA_VERSION,
             target_model_version=self.target_model_version,
             tokenizer_version=str(task.metadata.get("tokenizer_version", "unknown")),
-            num_tokens=num_tokens,
+            num_tokens=len(task.payload["input_ids"]),
             estimated_bytes=nbytes,
             metadata={
                 "run_id": self.run_id,
