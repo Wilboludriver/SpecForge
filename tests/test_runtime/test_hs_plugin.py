@@ -21,7 +21,7 @@ from specforge_sglang_capture.hs.attempts import AttemptCapacityDeclined, Attemp
 from specforge_sglang_capture.hs.config import HSConfig
 from specforge_sglang_capture.hs.protocol import FeatureSchema, FeatureSpec
 from specforge_sglang_capture.hs.runtime import HSCaptureRuntime
-from specforge.inference.capture_protocol import CaptureCapacityDeclined, CaptureProtocol
+from specforge.inference.capture_protocol import CaptureCapacityDeclined, CaptureProtocol, request_digest
 
 
 @dataclasses.dataclass
@@ -274,6 +274,51 @@ class HSPluginTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("scheduler thread", str(errors[0]))
 
+    def test_claim_computes_one_digest_and_checks_wire_and_reservation_on_reentry(self):
+        hs = self.runtime()
+        req = self.request(hs)
+        spec = capture.request_spec(req)
+        original_digest = spec.pop("request_digest")
+        digest_path = "specforge_sglang_capture.hs.runtime.digest_request"
+        with mock.patch(digest_path, wraps=digest_request) as compute:
+            entry = hs._claim(req)
+            compute.assert_called_once_with(req.origin_input_ids, spec)
+            self.assertEqual(entry.request_digest, original_digest)
+
+            spec["request_digest"] = original_digest
+            compute.reset_mock()
+            self.assertIs(hs._claim(req), entry)
+            compute.assert_called_once_with(req.origin_input_ids, spec)
+
+            spec["request_digest"] = None
+            compute.reset_mock()
+            with self.assertRaisesRegex(ValueError, "capture request digest mismatch"):
+                hs._claim(req)
+            compute.assert_called_once_with(req.origin_input_ids, spec)
+
+            req.origin_input_ids[0] = 99
+            for wire_digest in (None, digest_request(req.origin_input_ids, spec)):
+                with self.subTest(wire_digest=wire_digest):
+                    spec.pop("request_digest", None)
+                    if wire_digest is not None:
+                        spec["request_digest"] = wire_digest
+                    compute.reset_mock()
+                    with self.assertRaisesRegex(ValueError, "generate payload differs from reservation"):
+                        hs._claim(req)
+                    compute.assert_called_once_with(req.origin_input_ids, spec)
+                    self.assertEqual(entry.request_digest, original_digest)
+                    self.assertIs(entry.request, req)
+
+    def test_request_digest_matches_v1_wire_vector(self):
+        tokens = [7, 42]
+        spec = {"features": {"last_hidden": "target", "aux": "hidden_states"},
+                "passthrough": [{"name": "loss_mask", "shape": [1, 2],
+                                 "dtype": "int64", "data": [[1, 0]]}],
+                "request_digest": "ignored"}
+        expected = "f454ff6ad858a09f05cd558ae110c6979e5cbee1ea10bfcf54e7e70cd288c4bc"
+        self.assertEqual(digest_request(tokens, spec), expected)
+        self.assertEqual(request_digest(tokens, spec), expected)
+
     @staticmethod
     def _record_error(errors, hs):
         try:
@@ -288,11 +333,15 @@ class HSPluginTests(unittest.TestCase):
             "gen": 1, "attempt_id": "a-" + name, "request_digest": "digest",
             "publication_ownership": "attempt-v1"}
         before = dict(hs.registry.active)
+        tokens_before = dict(hs.registry.tokens)
+        sequence_before = hs.registry.sequence
         reply = hs.control(hs.s, {"protocol_version": 1, "action": "begin_batch",
             "server_epoch": hs.epoch, "tasks": [task("new1"), task("new2")]})
         self.assertEqual(reply["error_code"], "capture_capacity_declined")
         self.assertIs(reply["reservation_granted"], False)
         self.assertEqual(hs.registry.active, before)
+        self.assertEqual(hs.registry.tokens, tokens_before)
+        self.assertEqual(hs.registry.sequence, sequence_before)
         protocol = CaptureProtocol("http://fixture", lambda *args, **kwargs: reply, 1)
         with self.assertRaises(CaptureCapacityDeclined):
             protocol.call({"action": "begin_batch"})

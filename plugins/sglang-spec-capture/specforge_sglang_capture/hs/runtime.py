@@ -374,16 +374,19 @@ class HSCaptureRuntime:
                 raise CaptureContractError("passthrough data does not match its declared shape")
         if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
             raise CaptureContractError("capture output names must be distinct nonempty strings")
-        if spec.get("request_digest", digest_request(req.origin_input_ids, spec)) != digest_request(req.origin_input_ids, spec):
+        request_digest = digest_request(req.origin_input_ids, spec)
+        if spec.get("request_digest", request_digest) != request_digest:
             raise CaptureContractError("capture request digest mismatch")
         entry = getattr(req, "_specforge_hs_attempt", None)
         if entry is None:
-            entry = self.registry.claim(spec, req.origin_input_ids)
+            entry = self.registry.claim(spec, request_digest)
             entry.request = req
             req._specforge_hs_attempt = entry
         elif (entry.revoked or entry.request is not req
               or self.registry.lookup(spec) is not entry):
             raise CaptureContractError("capture attempt is stale or revoked")
+        elif request_digest != entry.request_digest:
+            raise CaptureContractError("generate payload differs from reservation")
         req.extra_key = self.namespace if self.enabled else "spec-attempt:" + entry.token
         return entry
 
@@ -1051,21 +1054,14 @@ class HSCaptureRuntime:
         trial, entries = prepared
         replies = self._local_phase("control.begin.reply", lambda: [self._wire(entry) for entry in entries])
 
-        def commit():
-            self.registry.active, self.registry.tokens, self.registry.sequence = (
-                trial.active, trial.tokens, trial.sequence)
-        self._local_phase("control.begin.commit", commit)
+        self._local_phase("control.begin.commit", lambda: self.registry.commit_begin_batch(trial))
         return {"server_epoch": self.epoch, "attempts": replies} if action == "begin_batch" else replies[0]
 
     def _begin_trial(self, bodies, tokens):
-        trial = AttemptRegistry(self.registry.epoch, self.registry.capacity)
-        trial.active, trial.tokens, trial.sequence = (
-            dict(self.registry.active), dict(self.registry.tokens), self.registry.sequence)
         try:
-            entries = trial.begin_batch(bodies, tokens)
+            return self.registry.prepare_begin_batch(bodies, tokens)
         except AttemptCapacityDeclined:
             return None
-        return trial, entries
 
     def _lookup_control(self, body):
         try:

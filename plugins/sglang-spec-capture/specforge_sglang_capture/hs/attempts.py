@@ -98,15 +98,21 @@ class AttemptRegistry:
         return entry
 
     def begin_batch(self, bodies, tokens):
+        trial, entries = self.prepare_begin_batch(bodies, tokens)
+        self.commit_begin_batch(trial)
+        return entries
+
+    def prepare_begin_batch(self, bodies, tokens):
         # Validate the complete batch before changing the live registry.
         if len(bodies) != len(tokens) or len({self.identity(body) for body in bodies}) != len(bodies):
             raise ValueError("duplicate begin_batch identity or token count mismatch")
         trial = AttemptRegistry(self.epoch, self.capacity)
         trial.active, trial.tokens, trial.sequence = dict(self.active), dict(self.tokens), self.sequence
-        for body, token in zip(bodies, tokens):
-            trial.begin(body, token)
+        entries = [trial.begin(body, token) for body, token in zip(bodies, tokens)]
+        return trial, entries
+
+    def commit_begin_batch(self, trial):
         self.active, self.tokens, self.sequence = trial.active, trial.tokens, trial.sequence
-        return [self.active[self.identity(body)] for body in bodies]
 
     def lookup(self, body):
         token = str(body["reservation_token"])
@@ -115,11 +121,11 @@ class AttemptRegistry:
             raise ValueError("unknown, retired or mismatched reservation token")
         return entry
 
-    def claim(self, body, tokens):
+    def claim(self, body, request_digest):
         entry = self.lookup(body)
         if entry.revoked or entry.claimed:
             raise ValueError("reservation revoked or generation already claimed")
-        if digest_request(tokens, body) != entry.request_digest:
+        if request_digest != entry.request_digest:
             raise ValueError("generate payload differs from reservation")
         entry.claimed, entry.state = True, "QUEUED"
         return entry
