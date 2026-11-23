@@ -519,7 +519,11 @@ class SGLangServerCaptureAdapter:
         """Return the negotiated endpoint's atomic begin bound before leasing."""
         if self._capture_protocol is None:
             return None
-        return self._registration_capacity(self._capture_protocol.capability())
+        capability = self._capture_protocol.capability()
+        capacity = self._registration_capacity(capability)
+        if capability is not None and not capability.get("begin_batch"):
+            return 1
+        return capacity
 
     @staticmethod
     def _registration_capacity(capability):
@@ -567,14 +571,14 @@ class SGLangServerCaptureAdapter:
             payload["request_digest"] = request_digest(task.payload["input_ids"], payload)
             requests.append((payload, task.payload["input_ids"], payload["attempt_id"], names))
         from specforge.inference.capture_protocol import CaptureCapacityDeclined
+        for item in prepared:
+            item["registration_refused"] = False
         try:
             fences = self.store.begin_capture_attempts(self._capture_protocol, capability, requests)
         except CaptureCapacityDeclined:
             for item in prepared:
                 item["registration_refused"] = True
             raise
-        for item in prepared:
-            item["registration_refused"] = False
         for payload, fence in zip(payloads, fences):
             payload.update({name: capability[name] for name in ("server_epoch", "capture_namespace", "capture_signature")})
             payload.update({name: fence[name] for name in ("protocol_version", "attempt_id", "reservation_token")})

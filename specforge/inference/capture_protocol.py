@@ -105,6 +105,8 @@ class CaptureProtocol:
 
     def begin_batch(self, capability, requests):
         if not capability.get('begin_batch'):
+            if len(requests) > 1:
+                raise ValueError("endpoint requires individual begin calls with per-attempt ownership")
             return [self.begin(capability, spec, tokens, attempt_id) for spec, tokens, attempt_id in requests]
         tasks = [self._begin_body(capability, *request) for request in requests]
         result = self.call({'action': 'begin_batch', 'server_epoch': capability['server_epoch'], 'tasks': tasks})

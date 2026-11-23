@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from unittest import mock
 
-from specforge.inference.capture_protocol import CaptureProtocol
+from specforge.inference.capture_protocol import CaptureCapacityDeclined, CaptureProtocol
 from specforge.runtime.data_plane.mooncake_store import MooncakeFeatureStore
 from tests.test_runtime.test_server_capture import _FakeMooncakeStore
 
@@ -186,6 +186,33 @@ class BeginParallelTests(unittest.TestCase):
             self.assertEqual(url, self.first.url)
             self.assertEqual(body['server_epoch'], 'epoch')
             self.assertEqual(body['attempt_id'], intents[body['sample_id']].attempt_id)
+        self.assertFalse(self.store._capture_pending_begin)
+
+    def test_legacy_second_decline_keeps_first_fence_and_clears_unsent(self):
+        self.cap.pop('begin_batch')
+        def decline_second(url, body):
+            if body['sample_id'] == 'second':
+                raise CaptureCapacityDeclined("full")
+        self.transport.gate = decline_second
+        with self.assertRaisesRegex(RuntimeError, 'after 1 grants') as failure:
+            self.store.begin_capture_attempts(self.first, self.cap, [
+                self.request('first'), self.request('second'), self.request('third')])
+        self.assertNotIsInstance(failure.exception, CaptureCapacityDeclined)
+        self.assertFalse(self.store._capture_pending_begin)
+        self.assertEqual(set(self.store._capture_fences), {'first'})
+        self.assertEqual([body['sample_id'] for _, body in self.transport.calls], ['first', 'second'])
+
+    def test_legacy_first_lost_reply_keeps_only_sent_intent_for_recovery(self):
+        self.cap.pop('begin_batch')
+        self.transport.gate = mock.Mock(side_effect=TimeoutError("lost begin reply"))
+        with self.assertRaises(TimeoutError):
+            self.store.begin_capture_attempts(self.first, self.cap, [
+                self.request('first'), self.request('second')])
+        self.assertEqual(set(self.store._capture_pending_begin), {'first'})
+        self.transport.gate = None
+        self.store._recover_capture_begin('first')
+        self.assertEqual(self.transport.calls[0], self.transport.calls[1])
+        self.assertEqual(set(self.store._capture_fences), {'first'})
         self.assertFalse(self.store._capture_pending_begin)
 
     def test_legacy_single_begin_fallback_reenters_batch_flight(self):

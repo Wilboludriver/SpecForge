@@ -78,6 +78,39 @@ class CapacityBackpressure(unittest.TestCase):
         self.assertNotIn("begin_batch", server.calls)
         self.assertTrue(all("attempt_id" not in p for item in prepared for p in item["payloads"]))
 
+    def test_legacy_partial_registration_can_retire_the_granted_writer(self):
+        from specforge.inference.capture_protocol import CaptureCapacityDeclined
+        backend = _FakeMooncakeStore()
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        server = TransferServer(backend)
+        server.capability.pop("begin_batch")
+        attempts = []
+
+        def post(url, json_body, timeout):
+            if json_body.get("action") == "begin":
+                attempts.append(json_body["attempt_id"])
+                if len(attempts) == 2:
+                    return dict(error="full", error_code="capture_capacity_declined", reservation_granted=False)
+            return server(url, json_body, timeout)
+
+        adapter = SGLangServerCaptureAdapter(
+            "http://server", store, run_id="run0", algorithm="eagle3",
+            schema=_capture_schema("eagle3"), post_fn=post, control_fn=post,
+            hs_capture=True, hs_prefix_cache=True,
+        )
+        self.assertEqual(adapter.registration_capacity(), 1)
+        prepared = adapter.prepare_refs_batches([[_task(i, 5) for i in range(3)]], capture=_eagle3_contract())
+        with self.assertRaises(RuntimeError) as failure:
+            adapter.register_prepared_batches(prepared)
+        self.assertNotIsInstance(failure.exception, CaptureCapacityDeclined)
+        self.assertFalse(prepared[0]["registration_refused"])
+        self.assertEqual(len(server.active), 1)
+        self.assertFalse(store._capture_pending_begin)
+        adapter.discard_prepared_batches(prepared)
+        self.assertFalse(server.active)
+        self.assertFalse(store._capture_fences)
+        self.assertEqual(len(attempts), 2)
+
     def test_registration_and_each_lease_fit_advertised_capacity(self):
         for capacity, lease, concurrency in ((1, 1, 2), (1, 3, 2), (2, 3, 3)):
             with self.subTest(capacity=capacity, lease=lease, concurrency=concurrency), tempfile.TemporaryDirectory() as root:
@@ -129,17 +162,21 @@ class CapacityBackpressure(unittest.TestCase):
             self.assertEqual(len(adapter.produce_prepared(group, capture=_eagle3_contract())), 1)
 
     def test_atomic_refusal_retries_original_lease_without_prompt_failure(self):
-        for concurrency in (1, 3):
-            with self.subTest(concurrency=concurrency), tempfile.TemporaryDirectory() as root:
+        for concurrency, batch in ((1, True), (3, True), (3, False)):
+            with self.subTest(concurrency=concurrency, batch=batch), tempfile.TemporaryDirectory() as root:
                 backend = _FakeMooncakeStore()
                 store = MooncakeFeatureStore(store=backend, store_id="run0")
                 server = TransferServer(backend)
+                if not batch:
+                    server.capability.pop('begin_batch', None)
+                    server.capability['limits'] = {'attempt_capacity': 1}
                 attempts = []
                 refusal_count = 4
 
                 def post(url, json_body, timeout):
-                    if json_body.get("action") == "begin_batch":
-                        attempts.append(tuple(item["attempt_id"] for item in json_body["tasks"]))
+                    if json_body.get("action") == ("begin_batch" if batch else "begin"):
+                        tasks = json_body["tasks"] if batch else [json_body]
+                        attempts.append(tuple(item["attempt_id"] for item in tasks))
                         if len(attempts) <= refusal_count:
                             return dict(error="full", error_code="capture_capacity_declined", reservation_granted=False)
                     return server(url, json_body, timeout)

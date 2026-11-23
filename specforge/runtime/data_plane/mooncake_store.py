@@ -816,9 +816,31 @@ class MooncakeFeatureStore(FeatureStore):
                 if any(sid in self._capture_fences or sid in self._capture_ack_pending or sid in self._release_pending for sid in ids):
                     raise RuntimeError("prior capture attempt has not relinquished ownership")
                 self._capture_pending_begin.update(intents)
-            if not capability.get('begin_batch'):
-                return [self._recover_capture_begin(sid) for sid in ids]
             from specforge.inference.capture_protocol import CaptureCapacityDeclined
+            if not capability.get('begin_batch'):
+                replies = []
+                unsent = 0
+                try:
+                    for index, (sid, intent) in enumerate(intents):
+                        unsent = index + 1
+                        try:
+                            wire = protocol.begin(capability, intent.payload, intent.tokens, intent.attempt_id)
+                        except CaptureCapacityDeclined as exc:
+                            # A single begin refusal also settles this intent.
+                            unsent = index
+                            if replies:
+                                raise RuntimeError(
+                                    f"capture begin declined for {sid} after {index} grants"
+                                ) from exc
+                            raise
+                        self._finish_capture_begin(sid, intent, wire)
+                        replies.append(wire)
+                    return replies
+                finally:
+                    with self._lock:
+                        for sid, intent in intents[unsent:]:
+                            if self._capture_pending_begin.get(sid) is intent:
+                                self._capture_pending_begin.pop(sid)
             try:
                 replies = protocol.begin_batch(capability, [(intent.payload, intent.tokens, intent.attempt_id) for _, intent in intents])
             except CaptureCapacityDeclined:
