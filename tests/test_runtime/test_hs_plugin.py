@@ -201,14 +201,23 @@ class HSPluginTests(unittest.TestCase):
         self.assertIs(first.sink, sibling.sink)
         self.assertIsNotNone(first.sink)
         self.assertEqual((first.sink_count, sibling.sink_count), (2, 2))
-        self.spin(hs, store.entered.is_set)
-        held = first.sample
-        hs.deferred[0][1].cancel()
-        self.assertTrue(hs.deferred[0][1].done())
-        self.assertIs(first.sample, held)
-        self.assertFalse(first.sink.done())
+        try:
+            self.spin(hs, store.entered.is_set)
+            self.assertFalse(first.output.done())
+            self.assertFalse(sibling.output.done())
+            self.assertTrue(store.registered)
+            held = first.sample
+            hs.deferred[0][1].cancel()
+            self.assertTrue(hs.deferred[0][1].done())
+            self.assertIs(first.sample, held)
+            self.assertFalse(first.sink.done())
+            self.assertGreater(hs.controller.stats()["output_bytes"], 0)
+        finally:
+            gate.set()
+        first.sink.result(timeout=3)
+        self.assertFalse(store.registered)
+        self.assertFalse(sibling.output.done())  # The native owner has yet to observe completion.
         self.assertGreater(hs.controller.stats()["output_bytes"], 0)
-        gate.set()
         self.spin(hs, lambda: not hs.jobs)
         hs.deferred[1][1].result()
         result = hs.capture.results[reqs[1].rid]
