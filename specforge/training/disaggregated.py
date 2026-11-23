@@ -768,7 +768,6 @@ def _build_online(
             feature_store_max_resident_bytes=(
                 cfg.runtime.feature_store_max_resident_bytes
             ),
-            backpressure_poll_s=cfg.runtime.producer_backpressure_poll_s,
             peer_wait_timeout_s=peer_wait_timeout_s,
         )
 
@@ -876,8 +875,6 @@ def _build_online(
         async_ack=_consumer_async_ack(cfg),
         consumer_dispatch=cfg.runtime.consumer_dispatch,
         dispatch_num_anchors=cfg.training.objective_options.get("num_anchors", 512),
-        ref_poll_s=cfg.runtime.consumer_ref_poll_s,
-        distributor_poll_s=cfg.runtime.ref_distributor_poll_s,
     )
 
     return TrainingRun(trainer=trainer, on_finally=store.close)

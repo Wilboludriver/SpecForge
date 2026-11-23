@@ -496,9 +496,6 @@ class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
-    producer_backpressure_poll_s: float = Field(default=0.2, gt=0, allow_inf_nan=False)
-    consumer_ref_poll_s: float = Field(default=0.1, gt=0, allow_inf_nan=False)
-    ref_distributor_poll_s: float = Field(default=0.05, gt=0, allow_inf_nan=False)
     consumer_dispatch: Literal[
         "round_robin",
         "cost_balanced",
@@ -512,14 +509,6 @@ class RuntimeConfig(StrictConfigModel):
     resident_low_watermark_bytes: Optional[int] = Field(default=None, ge=0)
     feature_store_max_resident_bytes: Optional[int] = Field(default=None, gt=0)
     feature_store_max_quarantined_bytes: int = Field(default=8 << 30, ge=0)
-
-    @field_validator("producer_backpressure_poll_s", "consumer_ref_poll_s",
-                     "ref_distributor_poll_s", mode="before")
-    @classmethod
-    def _poll_seconds_numeric(cls, value):
-        if isinstance(value, bool):
-            raise ValueError("polling intervals must be positive finite numbers")
-        return value
 
     @model_validator(mode="after")
     def _validate_watermarks(self):
