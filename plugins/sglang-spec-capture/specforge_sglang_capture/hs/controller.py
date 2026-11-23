@@ -46,7 +46,6 @@ class _Execution:
     sample: MaterializedSample | None = None
     owned_output: dict[str, torch.Tensor] = field(default_factory=dict)
     cache_keys: tuple[ContentBlockKey, ...] = ()
-    fills: dict[str, object] = field(default_factory=dict)
     quarantined: list[object] = field(default_factory=list)
     completion_pending: bool = False
     drained_queued: bool = False
@@ -280,7 +279,7 @@ class CaptureController:
         assert all(v >= 0 for v in self._current.values())
 
     def _maybe_drained_locked(self, state: _Execution) -> None:
-        if state.jobs or state.reservations or state.fills or state.quarantined:
+        if state.jobs or state.reservations or state.quarantined:
             return
         state.drained.set()
         if not state.drained_queued:
@@ -615,8 +614,6 @@ class CaptureController:
                 event.set()
                 return DrainHandle(event)
             state.cancelled, state.reason = True, str(reason)
-            for fill in tuple(state.fills.values()):
-                self.cache.abort_fill(fill)
             for token in tuple(state.reservations):
                 rec = self._reservations.get(token)
                 if rec is not None and not rec.submitted:
