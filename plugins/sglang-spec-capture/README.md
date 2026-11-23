@@ -183,14 +183,39 @@ with RDMA NICs. Without it, Mooncake installs its RDMA transport instead.
 
 ## Opt-in HS capture protocol v1
 
-This migration additionally needs SGLang's native
-`managers.prefix_admission.CAPTURE_ADMISSION_PROTOCOL == 1` companion extension.
-It does not apply the removed legacy capture patch. Enable
-`SPECFORGE_HS_CAPTURE=1` to negotiate server-issued attempt reservations at
-`POST /spec_capture/control`; set `SPECFORGE_HS_CACHE=1` to reuse hidden-state
-prefixes. `HS_CAPTURE=1, HS_CACHE=0` keeps the same complete-output, byte-budget
-and immutable-attempt protocol while forcing a zero prefix. The ordinary
-non-negotiated capture path remains available when both are off.
+Ordinary capture uses the official SGLang pin in [Install](#install). A Teacher
+with `SPECFORGE_HS_CAPTURE=1` also requires the [six SGLang companion
+patches](patches/sglang/c757c4bb/), including when `SPECFORGE_HS_CACHE=0`.
+The series adds scheduler-owned prefix admission, exact GDN checkpoints,
+cancellation-safe control replies, and rollback and shutdown handling.
+At startup the plugin checks `managers.prefix_admission.CAPTURE_ADMISSION_PROTOCOL == 1`.
+
+Use a clean, separate SGLang checkout at the exact base commit below. From
+the root of this SpecForge checkout, with the Teacher environment activated
+and the source-build prerequisites from [Install](#install) in place, apply
+the series in order and install the patched source.
+
+```bash
+(
+    set -eu
+    plugin_dir="$(pwd -P)/plugins/sglang-spec-capture"
+    cd /absolute/path/to/sglang
+    test "$(git rev-parse HEAD)" = "c757c4bb7c55d1eb69fdb2bdc6e6fb8507acb7a0"
+    git am "$plugin_dir"/patches/sglang/c757c4bb/000[1-6]-*.patch
+    test "$(git rev-parse 'HEAD^{tree}')" = "1e2bd88315469e2d3f522b171613c4d9032491a5"
+    uv pip install --no-build-isolation --prerelease=allow -e ./python
+    uv pip install --no-deps -e "$plugin_dir"
+)
+```
+
+The expected source tree is from the validated SGLang commit
+`d3dd55e5c8ba260939da7740b8038d483adab412`. Replaying the series with `git am`
+can produce different commit IDs with the same source tree.
+
+Enable `SPECFORGE_HS_CAPTURE=1` to negotiate server-issued attempt reservations
+at `POST /spec_capture/control`. Set `SPECFORGE_HS_CACHE=1` to reuse hidden-state
+prefixes. With only capture enabled, the plugin uses the same complete-output,
+byte-budget and immutable-attempt protocol with a zero prefix.
 
 | Variable | Default |
 |---|---:|
